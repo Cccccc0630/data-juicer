@@ -1,7 +1,10 @@
 # yapf: disable
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import copy
 import random
-from typing import Optional
+from time import time
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 from loguru import logger
@@ -330,40 +333,277 @@ class VideoCaptioningFromFramesMapper(Mapper):
             generated_text_per_chunk.append(
                 generated_text_candidates_single_chunk[max_index])
         return generated_text_per_chunk
-
+    
+    def load_model(self, rank=None):
+        model, processor = get_model(self.model_key, rank=rank, use_cuda=self.use_cuda())
+        return model, processor
+    
     def process_batched(self, samples, rank=None, context=False):
-        """
-        :param samples:
-        :return:
+        # Step 1: 重构样本列表
+        reconstructed_samples = [
+            {key: samples[key][i] for key in samples}
+            for i in range(len(samples[self.text_key]))
+        ]
+        print(f"[Debug] Reconstructed samples counts: {len(reconstructed_samples)}")
 
-        Note:
-            This is a batched_OP, whose the input and output type are
-            both list. Suppose there are $N$ input sample list with batch
-            size as $b$, and denote caption_num as $M$.
-            the number of total samples after generation is $2Nb$
-            for 'random_any' and 'similar_one' mode,
-            and $(1+M)Nb$ for 'all' mode.
-        """
-        # reconstruct samples from "dict of lists" to "list of dicts"
-        reconstructed_samples = []
-        for i in range(len(samples[self.text_key])):
-            reconstructed_samples.append(
-                {key: samples[key][i]
-                 for key in samples})
+        # Step 2: 收集所有视频任务
+        video_tasks = []
+        for sample_idx, sample in enumerate(reconstructed_samples):
+            if self.video_key not in sample or not sample[self.video_key]:
+                continue
+            for vid_key in sample[self.video_key]:
+                video_tasks.append({
+                    'sample_index': sample_idx,
+                    'vid_key': vid_key,
+                    'sample': sample
+                })
+
+        if not video_tasks:
+            return samples
+
+        # Step 3: 使用线程池并发抽帧，生成缓存
+        def extract_frames(task: Dict) -> Tuple[str, Dict]:
+            vid_key = task.get('vid_key', '')
+            if not vid_key:
+                return vid_key, {'frames': [], 'size': (0, 0)}
+
+            for attempt in range(3):
+                try:
+                    dummy_sample = {self.video_key: [vid_key]}
+                    _, videos = load_data_with_context(dummy_sample, False, [vid_key], load_video)
+                    video = videos.get(vid_key) if videos else None
+                    if video is None:
+                        return vid_key, {'frames': [], 'size': (0, 0)}
+
+                    if self.frame_sampling_method == 'all_keyframes':
+                        frames, size = extract_key_frames(video)
+                    elif self.frame_sampling_method == 'uniform':
+                        frames, size = extract_video_frames_uniformly(video, self.frame_num)
+                    else:
+                        frames = []
+                        size = (0, 0)
+                    close_video(video)
+
+                    return vid_key, {
+                        'raw_frames': [(f, size) for f in frames],
+                        'size': size
+                    }
+                except Exception as e:
+                    logger.error(f"Error extracting frames for {vid_key}: {e}")
+                    time.sleep(1)
+            return vid_key, {'frames': [], 'size': (0, 0)}
+
+        max_workers = 64
+        video_frame_cache = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(extract_frames, task): task['vid_key'] for task in video_tasks}
+            for future in as_completed(futures):
+                vid_key, result = future.result()
+                if vid_key:
+                    video_frame_cache[vid_key] = result
+
+        torch.cuda.synchronize()
+        logger.info(f"Frame extraction completed, total videos cached: {len(video_frame_cache)}")
+
+        # Step 4: 准备模型与处理器
+        model, processor = self.load_model(rank=rank)
+        device = model.device
+
+        batch_inputs = []
+        generated_result_map = defaultdict(lambda: [[] for _ in range(self.caption_num)])
+
+        # Step 5: 构建所有帧输入列表，基于缓存避免重复抽帧
+        for (sample_idx, vid_key) in [(t['sample_index'], t['vid_key']) for t in video_tasks]:
+            sample = reconstructed_samples[sample_idx]
+            text = sample[self.text_key]
+
+            for chunk in text.split(SpecialTokens.eoc):
+                video_count = chunk.count(SpecialTokens.video)
+                if video_count == 0 or len(chunk.strip()) == 0:
+                    continue
+
+                text_with_only_special_tokens = remove_non_special_tokens(chunk)
+                prompt = self._get_prompt(sample)
+
+                frames_info = video_frame_cache.get(vid_key)
+                if not frames_info:
+                    logger.warning(f"No cached frames found for video {vid_key}")
+                    continue
+
+                frames_and_size = frames_info.get('raw_frames', [])
+                if not frames_and_size:
+                    continue
+
+                frames, size = zip(*frames_and_size)
+
+                for frame in frames:
+                    img = frame.to_image()
+                    if self.horizontal_flip:
+                        img = ImageOps.mirror(img)
+                    if self.vertical_flip:
+                        img = ImageOps.flip(img)
+
+                    batch_inputs.append({
+                        'image': img,
+                        'prompt': prompt,
+                        'chunk': chunk,
+                        'sample_idx': sample_idx,
+                        'vid_key': vid_key,
+                        'text_with_tokens': text_with_only_special_tokens
+                    })
+
+        logger.info(f"[Batch] Total frames for inference: {len(batch_inputs)}")
+
+        if not batch_inputs:
+            return samples
+
+        # Step 6: 批量推理
+        batch_size = 32
+        i = 0
+        while i < len(batch_inputs):
+            sub_batch = batch_inputs[i:i + batch_size]
+            images = [bi['image'] for bi in sub_batch]
+            prompts = [bi['prompt'] for bi in sub_batch] if sub_batch[0]['prompt'] else None
+
+            inputs = processor(text=prompts, images=images, return_tensors='pt').to(device)
+
+            with torch.no_grad():
+                for k in range(self.caption_num):
+                    generated_ids = model.generate(**inputs, max_new_tokens=128, do_sample=True)
+                    generated_texts = processor.batch_decode(generated_ids, skip_special_tokens=True)
+
+                    for j, gen_text in enumerate(generated_texts):
+                        bi = sub_batch[j]
+                        generated_result_map[(bi['sample_idx'], bi['chunk'])][k].append(gen_text.strip())
+
+            i += batch_size
+        logger.info(f"[Rank {device}] Peak Memory: Allocated={torch.cuda.max_memory_allocated(device) / (1024 ** 3):.2f} GB, Reserved={torch.cuda.max_memory_reserved(device) / (1024 ** 3):.2f} GB")
+    
+        # Step 6: 组装输出
         samples_after_generation = []
-        # do generation for each sample within the batch
-        for ori_sample in reconstructed_samples:
+        for sample_idx, sample in enumerate(reconstructed_samples):
             if self.keep_original_sample:
-                samples_after_generation.append(ori_sample)
-            generated_samples = self._process_single_sample(ori_sample,
-                                                            rank=rank,
-                                                            context=context)
-            if len(generated_samples) != 0:
-                samples_after_generation.extend(generated_samples)
-        # reconstruct samples from "list of dicts" to "dict of lists"
-        keys = samples_after_generation[0].keys()
-        res_samples = {}
-        for key in keys:
-            res_samples[key] = [s[key] for s in samples_after_generation]
+                samples_after_generation.append(sample)
 
+            text = sample[self.text_key]
+            offset = 0
+            generated_sample_group = [
+                copy.deepcopy(sample) for _ in range(self.num_newly_generated_samples)
+            ]
+            for s in generated_sample_group:
+                s[self.text_key] = ''
+
+            for chunk in text.split(SpecialTokens.eoc):
+                video_count = chunk.count(SpecialTokens.video)
+                if video_count == 0 or len(chunk.strip()) == 0:
+                    continue
+
+                text_with_only_special_tokens = remove_non_special_tokens(chunk)
+                place_holders = [SpecialTokens.video] * video_count
+
+                # 取该 sample_idx 和 chunk 的所有生成文本，结构是 caption_num 个列表，每个列表包含所有生成的文本
+                gen_candidates = generated_result_map.get((sample_idx, chunk), [[] for _ in range(self.caption_num)])
+
+                # 调用 reduce_captions，得到 num_newly_generated_samples 个列表，每个列表长度是 video_count（对应占位符数），每个元素是 str 或 list[str]
+
+                gen_text_all = self._reduce_captions(chunk, gen_candidates)
+                gen_text_all = self.normalize_reduce_output(gen_text_all, video_count, self.num_newly_generated_samples)
+                # print(f"[Debug] video_count={video_count}, placeholders={place_holders}")
+                # print(f"[Debug] gen_text_all={gen_text_all}, len={len(gen_text_all)}")
+                for i in range(len(gen_text_all)):
+                    new_text = insert_texts_after_placeholders(
+                        original_string=text_with_only_special_tokens,
+                        placeholders=place_holders,
+                        new_texts=gen_text_all[i],  # 一定是 List[str]，长度 == video_count
+                    )
+                    generated_sample_group[i][self.text_key] += new_text + SpecialTokens.eoc
+
+                offset += video_count
+
+            samples_after_generation.extend(generated_sample_group)
+
+        # Step 7: 转回 dict of lists
+        keys = samples_after_generation[0].keys()
+        res_samples = {key: [s[key] for s in samples_after_generation] for key in keys}
+        # print(res_samples)
         return res_samples
+
+    
+    def _get_prompt(self, sample):
+        if self.prompt_key and isinstance(sample.get(self.prompt_key), str):
+            return sample[self.prompt_key]
+        elif self.prompt and isinstance(self.prompt, str):
+            return self.prompt
+        return None
+    
+    def normalize_reduce_output(self, gen_texts, video_count, num_samples):
+        """
+        gen_texts: List[str] or List[List[str]] from _reduce_captions
+        video_count: int, 占位符个数
+        num_samples: int, num_newly_generated_samples
+
+        返回 List[List[str]]，符合格式
+        """
+        # 如果已经是List[List[str]]，检查长度匹配，否则转成需要的格式
+        if len(gen_texts) == 0:
+            # 空则返回空嵌套列表
+            return [[] for _ in range(num_samples)]
+
+        if isinstance(gen_texts[0], list):
+            # 是二维结构，补齐长度
+            ret = []
+            for item in gen_texts:
+                if len(item) < video_count:
+                    ret.append(item + [''] * (video_count - len(item)))
+                else:
+                    ret.append(item[:video_count])
+            # 补齐外层长度
+            while len(ret) < num_samples:
+                ret.append([''] * video_count)
+            return ret
+
+        else:
+            # 是一维字符串列表，包装成二维，内层长度video_count
+            ret = []
+            for i in range(num_samples):
+                # 按顺序或者全部一样的，都可以
+                # 这里假设gen_texts长度>=num_samples，或者循环取
+                text = gen_texts[i] if i < len(gen_texts) else ''
+                ret.append([text] * video_count)
+            return ret
+    # def process_batched(self, samples, rank=None, context=False):
+    #     """
+    #     :param samples:
+    #     :return:
+
+    #     Note:
+    #         This is a batched_OP, whose the input and output type are
+    #         both list. Suppose there are $N$ input sample list with batch
+    #         size as $b$, and denote caption_num as $M$.
+    #         the number of total samples after generation is $2Nb$
+    #         for 'random_any' and 'similar_one' mode,
+    #         and $(1+M)Nb$ for 'all' mode.
+    #     """
+    #     # reconstruct samples from "dict of lists" to "list of dicts"
+    #     reconstructed_samples = []
+    #     for i in range(len(samples[self.text_key])):
+    #         reconstructed_samples.append(
+    #             {key: samples[key][i]
+    #              for key in samples})
+    #     samples_after_generation = []
+    #     # do generation for each sample within the batch
+    #     for ori_sample in reconstructed_samples:
+    #         if self.keep_original_sample:
+    #             samples_after_generation.append(ori_sample)
+    #         generated_samples = self._process_single_sample(ori_sample,
+    #                                                         rank=rank,
+    #                                                         context=context)
+    #         if len(generated_samples) != 0:
+    #             samples_after_generation.extend(generated_samples)
+    #     # reconstruct samples from "list of dicts" to "dict of lists"
+    #     keys = samples_after_generation[0].keys()
+    #     res_samples = {}
+    #     for key in keys:
+    #         res_samples[key] = [s[key] for s in samples_after_generation]
+
+    #     return res_samples

@@ -134,6 +134,7 @@ def catch_map_single_exception(method, return_sample=True, skip_op_error=False, 
 class OP:
     _accelerator = "cpu"
     _batched_op = False
+    # _batched_op = True
 
     def __init__(self, *args, **kwargs):
         """
@@ -213,6 +214,7 @@ class OP:
 
     def use_cuda(self):
         return self.accelerator == "cuda" and is_cuda_available()
+        return False
 
     def runtime_np(self):
         op_proc = calculate_np(self._name, self.mem_required, self.cpu_required, self.num_proc, self.use_cuda())
@@ -334,6 +336,8 @@ class Mapper(OP):
 
     def process_batched(self, samples, *args, **kwargs):
         keys = samples.keys()
+        print("samples:", samples)  # 查看 samples 的格式
+        print("keys:", keys)        # 查看尝试访问哪些键
         first_key = next(iter(keys))
         num_samples = len(samples[first_key])
 

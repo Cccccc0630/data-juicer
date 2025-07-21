@@ -2,7 +2,7 @@ from typing import List, Union
 
 import numpy as np
 from pydantic import PositiveInt
-
+from loguru import logger
 from data_juicer import cuda_device_count
 from data_juicer.utils.constant import Fields, StatsKeys
 from data_juicer.utils.lazy_loader import LazyLoader
@@ -169,7 +169,7 @@ class VideoOcrAreaRatioFilter(Filter):
                 #         draw.polygon(points, outline='blue', width=1)
                 #     image.save(f'{video_key}-{idx}.jpg')
             video_ocr_area_ratios[video_key] = np.mean(frame_ocr_area_ratios)
-
+            logger.info(f"video_ocr_area_ratio: {video_ocr_area_ratios[video_key]:.4f}")
             if not context:
                 close_video(container)
 

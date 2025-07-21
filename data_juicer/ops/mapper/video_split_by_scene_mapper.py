@@ -83,6 +83,8 @@ class VideoSplitBySceneMapper(Mapper):
         self.detector_kwargs = {key: kwargs[key] for key in avaliable_kwargs if key in kwargs}
 
     def process_single(self, sample, context=False):
+        # print("Start processing sample with VideoSplitBySceneMapper")
+        # print(sample)
         # there is no video in this sample
         if self.video_key not in sample or not sample[self.video_key]:
             sample[Fields.source_file] = []
@@ -124,6 +126,8 @@ class VideoSplitBySceneMapper(Mapper):
 
         # replace split video tokens
         if self.text_key in sample:
+            # print(f"sample[{self.text_key}] type:", type(sample[self.text_key]))
+            # print(f"sample[{self.text_key}] value:", sample[self.text_key])
             scene_counts_iter = iter([scene_counts[key] for key in loaded_video_keys])
             updated_text = re.sub(
                 re.escape(SpecialTokens.video),
