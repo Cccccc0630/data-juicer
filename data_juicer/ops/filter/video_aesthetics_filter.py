@@ -207,7 +207,7 @@ class VideoAestheticsFilter(Filter):
     
     def compute_stats_batched(self, samples, rank=None, context=False):
         # print('Computing aesthetics scores for batch of samples')
-        print(f"[Debug] samples : {samples}")
+        print(samples)
         # 检查是否已经计算过
         if StatsKeys.video_frames_aesthetics_score in samples[Fields.stats]:
             print('Aesthetics scores already computed, returning samples')
@@ -219,9 +219,7 @@ class VideoAestheticsFilter(Filter):
         num_samples = len(samples[Fields.stats])
         # print(samples)
         # print(f'[DEBUG] Total samples to process: {num_samples}')
-        # print(f"[Debug] samples keys: {samples.keys()}")
-        # print(f"[Debug] samples[{self.video_key}]: {samples.get(self.video_key)}")
-        # print(f"[Debug] samples[{self.text_key}]: {samples.get(self.text_key)}")
+
         reconstructed_samples = [{key: samples[key][i] for key in keys} for i in range(num_samples)]
         # print(f'[DEBUG] Reconstructed samples: {reconstructed_samples}')
         video_tasks = []
@@ -229,7 +227,7 @@ class VideoAestheticsFilter(Filter):
             if self.video_key not in sample or not sample[self.video_key]:
                 continue
             for vid_key in sample[self.video_key]:
-                print(f"[DEBUG] sample_idx={sample_idx}, vid_key={vid_key}")
+                
                 video_tasks.append({
                     'sample_index': sample_idx,
                     'vid_key': vid_key,

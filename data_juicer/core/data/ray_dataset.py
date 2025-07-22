@@ -462,13 +462,13 @@ class RayDataset(DJDataset):
                     # 转回 pyarrow.Table
                     final_table = pyarrow.Table.from_pylist(merged_records)
 
-                    try:
-                        df = final_table.to_pandas()
-                        print("→ Preview merged result:\n", df.head(5))
-                        dup = df[df.duplicated()]
-                        print(f"→ Duplicate rows detected: {len(dup)}")
-                    except Exception as e:
-                        print(f"⚠️ Failed to convert to pandas: {e}")
+                    # try:
+                    #     df = final_table.to_pandas()
+                    #     print("→ Preview merged result:\n", df.head(5))
+                    #     dup = df[df.duplicated()]
+                    #     print(f"→ Duplicate rows detected: {len(dup)}")
+                    # except Exception as e:
+                    #     print(f"⚠️ Failed to convert to pandas: {e}")
 
                     self.data = from_arrow(final_table)
                 else:
@@ -511,7 +511,12 @@ class RayDataset(DJDataset):
         })
 
         for rec in records:
-            video_key = rec['videos'][0] if isinstance(rec['videos'], list) else rec['videos']
+            # 关键点：确保 video_key 是 hashable 类型
+            video_key = rec['videos']
+            if isinstance(video_key, list):
+                while isinstance(video_key, list):
+                    video_key = video_key[0] if video_key else None
+            video_key = str(video_key)
 
             if merged[video_key]["videos"] is None:
                 merged[video_key]["videos"] = rec["videos"]
@@ -527,6 +532,7 @@ class RayDataset(DJDataset):
                 "aesthetics_scores": data["aesthetics_scores"]
             })
         return merged_list
+
     # def process(self, operators, *, exporter=None, checkpointer=None, tracer=None) -> DJDataset:
     #     if operators is None:
     #         return self
