@@ -192,10 +192,12 @@ class RayDataset(DJDataset):
 
         from ray.data import from_arrow
 
-        actors = []
-
+        actors = {}
+        actor_allocate = [3, 1, 1]
         # 初始化所有 actor
         for idx, op in enumerate(operators):
+            actors[op._name] = []
+
             columns = self.data.columns()
             if isinstance(op, Filter) and Fields.stats not in columns:
                 def process_batch_arrow(table: pyarrow.Table):
@@ -212,45 +214,49 @@ class RayDataset(DJDataset):
                 batch_size = 1
 
             gpu_allocate = 1 if op.use_cuda() else 0
+            cpu_allocate = 1 if idx==0 else 4
 
-            actor = ComputeActor.options(
-                name=f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
-                # num_gpus=0.5 if op.use_cuda() else 0,
-                num_gpus=gpu_allocate,
-                num_cpus=4,
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=self.gpu_pg,
-                    placement_group_capture_child_tasks=True
-                ),
-                placement_group_bundle_index=idx,
-                runtime_env={
-                    "env_vars": {"CUDA_VISIBLE_DEVICES": "0,1"} if op.use_cuda() else {},
-                    "nsight": {
-                        "t": "cuda,nvtx,osrt",
-                        "cuda-memory-usage": "true",
-                        "stats": "true",
-                        "cuda-graph-trace": "graph",
+            num_actors = actor_allocate[idx]
+            for actor_num in range(num_actors):
+
+                actor = ComputeActor.options(
+                    name=f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
+                    # num_gpus=0.5 if op.use_cuda() else 0,
+                    num_gpus=gpu_allocate,
+                    num_cpus=cpu_allocate,
+                    scheduling_strategy=PlacementGroupSchedulingStrategy(
+                        placement_group=self.gpu_pg,
+                        placement_group_capture_child_tasks=True
+                    ),
+                    # placement_group_bundle_index=0,
+                    runtime_env={
+                        "env_vars": {"CUDA_VISIBLE_DEVICES": "0,1"} if op.use_cuda() else {},
+                        # "nsight": {
+                        #     "t": "cuda,nvtx,osrt",
+                        #     "cuda-memory-usage": "true",
+                        #     "stats": "true",
+                        #     "cuda-graph-trace": "graph",
+                        # }
                     }
-                }
-            ).remote(op, batch_size)
-            actors.append(actor)
+                ).remote(op, batch_size)
+                actors[op._name].append(actor)
         
+        op_indices = {op_name: 0 for op_name in actors.keys()}
+
+        def get_next_actor(op_name):
+            """轮询获取下一个actor"""
+            actor_list = actors[op_name]
+            idx = op_indices[op_name]
+            op_indices[op_name] = (idx + 1) % len(actor_list)
+            return actor_list[idx]
 
         input_batches = list(self.data.iter_batches(batch_size=batch_size, batch_format="pyarrow"))
         print(f"Total batches generated: {len(input_batches)}")
-
-        # 设置调试日志格式
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s'
-        )
-        logger = logging.getLogger(__name__)
 
         futures = []
         buckets = defaultdict(list)
         op_batch_counters = defaultdict(int)
 
-        # 记录初始状态
         logger.info(f"初始化: futures={len(futures)} items, buckets={dict(buckets)}")
 
         for batch_idx, batch in enumerate(input_batches):
@@ -271,8 +277,9 @@ class RayDataset(DJDataset):
                 current = record
                 logger.debug(f"初始 current: {type(current)} {current}")
 
-                for op_idx, (op, actor) in enumerate(zip(operators, actors)):
-                    op_name = op.__class__.__name__
+                for op_idx, op in enumerate(operators):
+                    op_name = op._name
+                    actor = get_next_actor(op_name)  # 修改点：从字典轮询获取actor
                     logger.info(f"操作 {op_idx} ({op_name}) - 输入: {type(current)}")
 
                     if op.is_batched_op():
@@ -281,11 +288,13 @@ class RayDataset(DJDataset):
 
                         if len(buckets[op_idx]) >= batch_size:
                             logger.info(f"触发 flush bucket[{op_idx}] (达到 batch_size={batch_size})")
-                            refs = self.flush_bucket(op_idx, operators, actors, buckets, op_batch_counters)
+                            # 修改点：传递单个actor而不是整个列表
+                            refs = self.flush_bucket(op_idx, operators, {op_name: [actor]}, buckets, op_batch_counters)
                             logger.info(f"flush 返回 {len(refs)} 个 refs: {[type(r) for r in refs]}")
 
                             if op_idx + 1 < len(operators):
                                 next_op = operators[op_idx + 1]
+                                next_op_name = next_op._name
                                 if next_op.is_batched_op():
                                     logger.info(f"传递到下一个 batched op {op_idx + 1}")
                                     for ref in refs:
@@ -296,7 +305,14 @@ class RayDataset(DJDataset):
                                             buckets[op_idx + 1].append(r)
                                             if len(buckets[op_idx + 1]) >= batch_size:
                                                 logger.info(f"下级 bucket 满，触发 flush")
-                                                new_refs = self.flush_bucket(op_idx + 1, operators, actors, buckets, op_batch_counters)
+                                                next_actor = get_next_actor(next_op_name)
+                                                new_refs = self.flush_bucket(
+                                                    op_idx + 1, 
+                                                    operators, 
+                                                    {next_op_name: [next_actor]}, 
+                                                    buckets, 
+                                                    op_batch_counters
+                                                )
                                                 futures.extend(new_refs)
                                                 logger.info(f"添加 {len(new_refs)} 个 futures (来自下级 flush), 现在总数: {len(futures)}")
                                     break
@@ -327,12 +343,14 @@ class RayDataset(DJDataset):
                 if current is not None and not any(op.is_batched_op() for op in operators):
                     futures.append(current)
 
-        # 处理未满的 buckets
+        # 处理未满的 buckets (同样需要修改为使用字典结构)
         logger.info("\n=== 处理未满的 buckets ===")
         for op_idx in range(len(operators)):
             if buckets[op_idx]:
+                op_name = operators[op_idx]._name
+                actor = get_next_actor(op_name)
                 logger.info(f"flush bucket[{op_idx}] (大小: {len(buckets[op_idx])})")
-                refs = self.flush_bucket(op_idx, operators, actors, buckets, op_batch_counters)
+                refs = self.flush_bucket(op_idx, operators, {op_name: [actor]}, buckets, op_batch_counters)
                 logger.info(f"得到 {len(refs)} 个 refs: {[type(r) for r in refs]}")
 
                 for ref in refs:
@@ -345,13 +363,21 @@ class RayDataset(DJDataset):
                         logger.info(f"处理第 {sample_idx} 个 sample")
                         temp = sample
                         for next_op_idx in range(op_idx + 1, len(operators)):
-                            next_op, next_actor = operators[next_op_idx], actors[next_op_idx]
+                            next_op = operators[next_op_idx]
+                            next_op_name = next_op._name
+                            next_actor = get_next_actor(next_op_name)
                             if next_op.is_batched_op():
                                 logger.info(f"添加到 bucket[{next_op_idx}]")
                                 buckets[next_op_idx].append(temp)
                                 if len(buckets[next_op_idx]) >= batch_size:
                                     logger.info(f"触发 flush bucket[{next_op_idx}]")
-                                    new_refs = self.flush_bucket(next_op_idx, operators, actors, buckets, op_batch_counters)
+                                    new_refs = self.flush_bucket(
+                                        next_op_idx, 
+                                        operators, 
+                                        {next_op_name: [next_actor]}, 
+                                        buckets, 
+                                        op_batch_counters
+                                    )
                                     futures.extend(new_refs)
                                     logger.info(f"添加 {len(new_refs)} 个 futures, 现在总数: {len(futures)}")
                                 break
@@ -412,6 +438,7 @@ class RayDataset(DJDataset):
 
         # 写入JSONL文件
         output_path = "output.jsonl"
+        start = time.time()
         with open(output_path, 'w', encoding='utf-8') as f:
             for record in results:
                 try:
@@ -428,46 +455,64 @@ class RayDataset(DJDataset):
                     print(f"Error writing record: {e}\nRecord: {record}")
 
         print(f"成功写入 {len(results)} 条数据到 {output_path}")
-        
+        print(f"写入耗时: {time.time() - start:.3f} s.")
 
         return self
 
     
-    def flush_bucket(self, op_idx, operators, actors, buckets, op_batch_counters):
-            """将 bucket 中的数据拼成 pyarrow 表，并送入对应 actor 执行"""
-            op, actor = operators[op_idx], actors[op_idx]
-            bucket = buckets[op_idx]
-            if not bucket:
-                return []
-            op_name = op._name
-            op_batch_counters[op_idx] += 1
-            print(f"[DEBUG] → Flushing {op_name} (index {op_idx}) | Batch #{op_batch_counters[op_idx]} | Size: {len(bucket)}")
+    def flush_bucket(self, op_idx, operators, actors_dict, buckets, op_batch_counters):
+        """将 bucket 中的数据拼成 pyarrow 表，并送入对应 actor 执行
+        
+        Args:
+            op_idx: 操作索引
+            operators: 所有操作列表
+            actors_dict: 字典结构 {op_name: [actor1, actor2,...]}
+            buckets: 数据桶
+            op_batch_counters: 操作批计数器
+        """
+        op = operators[op_idx]
+        op_name = op._name
+        
+        # 从字典中获取对应op的actors列表
+        if op_name not in actors_dict:
+            raise ValueError(f"No actors found for operator {op_name}")
+        
+        # 使用字典中该op的第一个actor（因为外部已经做了轮询选择）
+        actor = actors_dict[op_name][0]
+        
+        bucket = buckets[op_idx]
+        if not bucket:
+            return []
+        
+        op_batch_counters[op_idx] += 1
+        print(f"[DEBUG] → Flushing {op_name} (index {op_idx}) | Batch #{op_batch_counters[op_idx]} | Size: {len(bucket)}")
 
-            # 合并 pylist 为 pyarrow.Table
-            flattened_bucket = []
-
-            for item in bucket:
-                if isinstance(item, pyarrow.Table):
-                    flattened_bucket.extend(item.to_pylist())
-                elif isinstance(item, dict):
-                    flattened_bucket.append(item)
-                else:
-                    raise TypeError(f"[flush_bucket] Unsupported item type in bucket: {type(item)}")
-
-            if not flattened_bucket:
-                return []
-
-            table = pyarrow.Table.from_pylist(flattened_bucket)
-            if isinstance(op, Filter):
-                ref = actor.process_and_filter.remote(table)
-            elif isinstance(op, Mapper):
-                ref = actor.mapper.remote(table)
+        # 合并 pylist 为 pyarrow.Table
+        flattened_bucket = []
+        for item in bucket:
+            if isinstance(item, pyarrow.Table):
+                flattened_bucket.extend(item.to_pylist())
+            elif isinstance(item, dict):
+                flattened_bucket.append(item)
             else:
-                raise NotImplementedError(f"Unsupported batched op type: {type(op)}")
-            
-            # 清空 bucket
-            buckets[op_idx] = []
-            return [ref]
+                raise TypeError(f"[flush_bucket] Unsupported item type in bucket: {type(item)}")
+
+        if not flattened_bucket:
+            return []
+
+        table = pyarrow.Table.from_pylist(flattened_bucket)
+        
+        # 根据操作类型调用不同的actor方法
+        if isinstance(op, Filter):
+            ref = actor.process_and_filter.remote(table)
+        elif isinstance(op, Mapper):
+            ref = actor.mapper.remote(table)
+        else:
+            raise NotImplementedError(f"Unsupported batched op type: {type(op)}")
+        
+        # 清空 bucket
+        buckets[op_idx] = []
+        return [ref]
 
     def merge_tables_to_one_row(self, all_batches: list[pa.Table]) -> pa.Table:
         # 把每个 Table 转为 List[Dict]
