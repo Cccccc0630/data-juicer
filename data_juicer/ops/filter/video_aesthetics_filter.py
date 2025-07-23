@@ -207,7 +207,8 @@ class VideoAestheticsFilter(Filter):
     
     def compute_stats_batched(self, samples, rank=None, context=False):
         # print('Computing aesthetics scores for batch of samples')
-        print(samples)
+        print("samples type:", type(samples))
+        print("samples:", samples)
         # 检查是否已经计算过
         if StatsKeys.video_frames_aesthetics_score in samples[Fields.stats]:
             print('Aesthetics scores already computed, returning samples')
@@ -363,14 +364,20 @@ class VideoAestheticsFilter(Filter):
         long_dict = {
             'videos': [],
             'text': [],
-            'video_frames_aesthetics_score': []
+            'video_frames_aesthetics_score': [],
+            '__dj__source_file__': []
         }
 
         for sample in reconstructed_samples:
-
             long_dict['videos'].append(sample['videos'][0])
             long_dict['text'].append(sample['text'])
             long_dict['video_frames_aesthetics_score'].append(sample['__dj__stats__']['video_frames_aesthetics_score'])
+            # 添加 __dj__source_file__ 字段
+            if '__dj__source_file__' in sample:
+                long_dict['__dj__source_file__'].append(sample['__dj__source_file__'])
+            else:
+                # 如果原始样本中没有这个字段，添加一个空值或默认值
+                long_dict['__dj__source_file__'].append(None)
 
         return long_dict
     
@@ -406,7 +413,7 @@ class VideoAestheticsFilter(Filter):
         keep_bools_batch = []
 
         for idx, aesthetics_scores in enumerate(aesthetics_scores_batch):
-            print(f"[Debug] Sample {idx} - aesthetics_scores: {aesthetics_scores}")
+            # print(f"[Debug] Sample {idx} - aesthetics_scores: {aesthetics_scores}")
             if len(aesthetics_scores) <= 0:
                 keep_bools_batch.append(True)
                 continue

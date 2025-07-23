@@ -2,6 +2,7 @@ from functools import partial
 import os
 import time
 from typing import Any, Dict, List, Union
+from unittest import result
 from data_juicer.ops.base_op import Filter, Mapper
 from data_juicer.utils.constant import Fields, StatsKeys
 import ray
@@ -121,120 +122,76 @@ class ComputeActor:
             print(f"[Actor] {self.op._name} Model loaded in {time.time() - start:.3f} seconds from {start} to {time.time()}")
 
     def process_and_filter(self, batch: pyarrow.Table) -> pyarrow.Table:
-        # print(f"\nbatch!!!!!: {batch}\n")
-        # print(f"[Actor Debug] Processing batch with {len(batch)} rows")
         self.call_count += 1
-        # print(f"[Actor] Call count: {self.call_count}, Rows: {len(batch)}")
+        logger.info(f"[Actor] Processing batch with {len(batch)} rows (call #{self.call_count})")
 
         try:
-            # 1. 先判断batch类型，获得records列表（dict列表）
-            if isinstance(batch, list):
-                # 如果list中的元素是Table，需要进一步处理
-                records = []
-                for item in batch:
-                    if isinstance(item, pa.Table):
-                        # 将Table转换为字典列表并扩展到records中
-                        table_records = item.to_pylist()
-                        records.extend(table_records)
-                    elif isinstance(item, dict):
-                        records.append(item)
-                    else:
-                        print(f"Warning: Unexpected item type in batch: {type(item)}")
-                        
-            elif isinstance(batch, pa.Table):
-                records = batch.to_pylist()
-            else:
-                raise TypeError(f"Unsupported batch type: {type(batch)}")
+            # 1. 转换表格为记录列表
+            records = batch.to_pylist()
+            logger.debug(f"原始记录数: {len(records)}")
 
-            # 2. 转换并标准化输入数据
-            std_records = []
-            for i, record in enumerate(records):
-                print(f"Processing record {i}: type={type(record)}")
-                # print("\nrecord:  ", record)
-                # 确保record是字典
-                if isinstance(record, pa.Table):
-                    # 如果单个record还是Table，转换它
-                    print("still Table:", record)
-                    table_records = record.to_pylist()
-                    for table_record in table_records:
-                        if isinstance(table_record, dict):
-                            std_records.append(table_record)
-                elif isinstance(record, dict):
-                    std_records.append(record)
-                else:
-                    print(f"Warning: Skipping record {i}, unexpected type: {type(record)}")
-            print(f"Total records after conversion: {len(std_records)}")
-            new_std_records = []
-            # 现在使用std_records进行后续处理
-            for record in std_records:
-                # print("\nrecord:  ", record)
-                if record.get('videos'):
-                    # 兼容三层和两层嵌套
-                    if isinstance(record['videos'][0][0], list):
-                        videos = [v[0][0] for v in record['videos']]
-                    else:
-                        videos = [record['videos'][0][0]]
+            # 2. 标准化记录结构
+            processed_records = []
+            for record in records:
+                # 深度解包视频路径（处理三层嵌套）
+                if 'videos' in record:
+                    videos = []
+                    for video_group in record['videos']:  # 第一层
+                        if isinstance(video_group, list):
+                            for video_list in video_group:  # 第二层
+                                if isinstance(video_list, list):
+                                    videos.extend(video_list)  # 第三层
+                                else:
+                                    videos.append(video_list)
+                        else:
+                            videos.append(video_group)
+                    record['videos'] = videos
 
-                text = record['text'][0] if isinstance(record['text'], list) else record['text']
+                # 处理文本字段
+                if isinstance(record.get('text'), list):
+                    record['text'] = record['text'][0] if record['text'] else ""
 
-                new_std_record = {
-                    "videos": videos,
-                    "text": text,
-                    "__dj__stats__": record.get("__dj__stats__", {}),
-                    "__dj__source_file__": record.get("__dj__source_file__", "")
-                }
-                new_std_records.append(new_std_record)
+                processed_records.append(record)
 
-            # 3. 准备批量处理数据
-            samples = {
-                "videos": [r["videos"] for r in new_std_records],
-                "text": [r["text"] for r in new_std_records],
-                "__dj__stats__": [r["__dj__stats__"] for r in new_std_records],
-                "__dj__source_file__": [r["__dj__source_file__"] for r in new_std_records]
-            }
+            logger.debug(f"处理后记录数: {len(processed_records)}")
+            logger.debug(f"首条记录视频路径: {processed_records[0].get('videos', [])[:1]}...")
 
-            # 4. 执行统计计算
-            stats_records = self.op.compute_stats_batched(samples)
-            print(f"\n\nComputed stats: {stats_records.keys()}")
-
-            # 5. 构建过滤用的数据结构
-            converted_batch = {
-                Fields.stats: [
-                    {
-                        StatsKeys.video_frames_aesthetics_score: score,
-                        StatsKeys.video_duration: duration
-                    }
-                    for score, duration in zip(
-                        stats_records[StatsKeys.video_frames_aesthetics_score],
-                        stats_records.get(StatsKeys.video_duration, [0]*len(stats_records[StatsKeys.video_frames_aesthetics_score]))
-                    )
-                ]
-            }
-
-            # 6. 执行过滤
-            keep_flags = self.op.process_batched(converted_batch)
-
+            # 3. 过滤记录
             filtered_records = [
-                {
-                    "videos": [[stats_records["videos"][i]]],
-                    "text": stats_records["text"][i],
-                    "aesthetics_score": stats_records[StatsKeys.video_frames_aesthetics_score][i],
-                    # "video_duration": stats_records.get(StatsKeys.video_duration, [0]*len(stats_records[StatsKeys.video_frames_aesthetics_score]))[i],
-                    # "__dj__stats__": stats_records["__dj__stats__"][i],
-                    # "__dj__source_file__": stats_records["__dj__source_file__"][i]
-                }
-                for i, keep in enumerate(keep_flags) if keep
+                record for record in processed_records
+                if self.op.process_single(record)
             ]
-            # 7. 返回结果
-            if not filtered_records:
-                print("No records passed the filter")
-                return None
 
-            return pyarrow.Table.from_pylist(filtered_records)
+            # 4. 重建表格（保持原始结构）
+            schema = pyarrow.schema([
+                ("videos", pyarrow.list_(pyarrow.list_(pyarrow.string()))),
+                ("text", pyarrow.string()),
+                ("__dj__stats__", pyarrow.map_(pyarrow.string(), pyarrow.string())),
+                ("__dj__source_file__", pyarrow.list_(pyarrow.string()))
+            ])
+
+            # 将单层视频列表重新包装为三层结构
+            final_records = []
+            for record in filtered_records:
+                final_record = {
+                    "videos": [[record['videos']]] if record.get('videos') else [[]],
+                    "text": record.get('text', ''),
+                    "__dj__stats__": record.get('__dj__stats__', {}),
+                    "__dj__source_file__": record.get('__dj__source_file__', [])
+                }
+                final_records.append(final_record)
+
+            return pyarrow.Table.from_pylist(final_records, schema=schema)
 
         except Exception as e:
-            print(f"[Actor] Processing failed: {e}")
-            print(f"Last processed records: {std_records[-1] if std_records else 'None'}")
+            logger.error(f"处理失败: {str(e)}")
+            # 保存调试信息
+            debug_data = {
+                "input_sample": batch.slice(0, 1).to_pylist()[0] if len(batch) > 0 else None,
+                "error": str(e)
+            }
+            with open("filter_debug.json", "w") as f:
+                json.dump(debug_data, f, indent=2)
             raise
     
     def mapper(self, batch: Union[pa.Table, List[Dict]]) -> pa.Table:
@@ -298,8 +255,8 @@ class ComputeActor:
                 if isinstance(batched_input[k], list):
                     batched_input[k] = batched_input[k][:min_len]
 
-            print(f"[Mapper] Final batched input keys: {list(batched_input.keys())}")
-            print(f"[Mapper] Length: {min_len}")
+            # print(f"[Mapper] Final batched input keys: {list(batched_input.keys())}")
+            # print(f"[Mapper] Length: {min_len}")
 
             # Step 5: 执行 batched operator
             output = self.op.process_batched(batched_input)
@@ -312,8 +269,13 @@ class ComputeActor:
                 output_records = dict_of_lists_to_list_of_dicts(output)
             else:
                 output_records = output  # assume already List[Dict]
+            result = pa.Table.from_pylist(output_records)
+            # print("Mapper records schema:", result.schema)
+            result = self.unify_mapper_schema(result)
 
-            return pa.Table.from_pylist(output_records)
+            # print(f"Unified Mapper records schema: {result.schema}")
+            # print(result)
+            return result
 
 
         except Exception as e:
@@ -324,10 +286,10 @@ class ComputeActor:
 
     def mapper_single(self, batch: pyarrow.Table) -> pyarrow.Table:
         try:
-            print(batch)
+            # print(batch)
             # 1. 原始转换
             records = convert_record(batch, root_path="/home/xcy")
-            print("\n\n")
+            # print("\n\n")
             # print("records after convert:", records)
             records = flatten_records(records)
             # 2. 处理记录
@@ -350,12 +312,50 @@ class ComputeActor:
             elif isinstance(records, list):
                 # 已经是列表格式则直接使用
                 standardized_records = records
-
-            # 4. 转换为PyArrow Table
-            return pyarrow.Table.from_pylist(standardized_records)
             
+
+            result = pyarrow.Table.from_pylist(standardized_records)
+            # print("Split records schema:", result.schema)
+            # # 4. 转换为PyArrow Table
+            # print(result)
+            return result
+
         except Exception as e:
             print(f"[Actor(Mapper)] Failed: {e}")
             raise
 
+    def unify_mapper_schema(self, table: pa.Table) -> pa.Table:
+        columns = {}
 
+        # === 1. 统一 videos 为 list<list<string>> ===
+        if 'videos' in table.column_names:
+            orig_videos = table['videos'].to_pylist()
+            new_videos = []
+            for v in orig_videos:
+                if isinstance(v, list):
+                    if len(v) > 0 and isinstance(v[0], list):
+                        new_videos.append(v)
+                    else:
+                        new_videos.append([v])  # 转成 list<list<string>>
+                else:
+                    new_videos.append([[]])  # 空值统一为 [[]]
+            columns['videos'] = pa.array(new_videos, type=pa.list_(pa.list_(pa.string())))
+
+        # === 2. 保持 text 不变 ===
+        if 'text' in table.column_names:
+            columns['text'] = table['text']
+
+        # === 3. 统一 aesthetics_score 为 list<item: double> ===
+        if 'aesthetics_score' in table.column_names:
+            orig_scores = table['aesthetics_score'].to_pylist()
+            new_scores = []
+            for score in orig_scores:
+                if isinstance(score, list):
+                    # 确保是 list<double> 格式
+                    new_scores.append(score)
+                else:
+                    new_scores.append([score])  # 单个数值转换成 list<double>
+            columns['aesthetics_score'] = pa.array(new_scores, type=pa.list_(pa.float64()))
+
+        # 返回格式统一后的表
+        return pa.table(columns)

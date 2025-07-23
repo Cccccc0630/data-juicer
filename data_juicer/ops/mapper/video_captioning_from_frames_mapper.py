@@ -344,7 +344,7 @@ class VideoCaptioningFromFramesMapper(Mapper):
             {key: samples[key][i] for key in samples}
             for i in range(len(samples[self.text_key]))
         ]
-        print(f"[Debug] Reconstructed samples counts: {len(reconstructed_samples)}")
+        # print(f"[Debug] Reconstructed samples counts: {len(reconstructed_samples)}")
 
         # Step 2: 收集所有视频任务
         video_tasks = []
