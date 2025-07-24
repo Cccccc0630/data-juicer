@@ -174,16 +174,16 @@ class RayDataset(DJDataset):
 
         return [row[column] for row in self.data.take()]
     
-    # def process(self, operators, *, exporter=None, checkpointer=None, tracer=None) -> DJDataset:
-    #     if operators is None:
-    #         return self
-    #     if not isinstance(operators, list):
-    #         operators = [operators]
-    #     for op in operators:
-    #         self._run_single_op(op)
-    #         self.data = self.data.materialize()
-    #     return self
-    
+    def process1(self, operators, *, exporter=None, checkpointer=None, tracer=None) -> DJDataset:
+        if operators is None:
+            return self
+        if not isinstance(operators, list):
+            operators = [operators]
+        for op in operators:
+            self._run_single_op(op)
+            self.data = self.data.materialize()
+        return self
+
     def process(self, operators, *, exporter=None, checkpointer=None, tracer=None) -> DJDataset:
         if operators is None:
             return self
@@ -193,11 +193,22 @@ class RayDataset(DJDataset):
         from ray.data import from_arrow
 
         actors = {}
-        actor_allocate = [3, 1, 1]
-        # 初始化所有 actor
+        actor_allocate = [0, 1, 1]  # 每个operator分配的actor数量
+        # actors = []
+        op1 = operators[0] 
+        # split
+        logger.info("Video cliping")
+        self.data = self.data.map_batches(
+                    op1.process, batch_size=1, batch_format="pyarrow", num_gpus=0
+                )
+        # if self.data is not None:
+        #     logger.info("data type after clip:",self.data)
+        
+        # 初始化所有actor
         for idx, op in enumerate(operators):
             actors[op._name] = []
-
+            
+            # 数据预处理（保持不变）
             columns = self.data.columns()
             if isinstance(op, Filter) and Fields.stats not in columns:
                 def process_batch_arrow(table: pyarrow.Table):
@@ -205,42 +216,41 @@ class RayDataset(DJDataset):
                     new_table = table.append_column(Fields.stats, [new_column_data])
                     return new_table
                 self.data = self.data.map_batches(process_batch_arrow, batch_format='pyarrow')
-
-            # batch_size = getattr(op, 'batch_size', 1) if op.is_batched_op() else 1
-            # batch_size = 3
-            if op.is_batched_op():
-                batch_size = 15
-            else:
-                batch_size = 1
-
+            
+            
+            
+            # 设置batch size
+            batch_size = 15 if op.is_batched_op() else 1
+            
+            # 资源分配
             gpu_allocate = 1 if op.use_cuda() else 0
-            cpu_allocate = 1 if idx==0 else 4
-
-            num_actors = actor_allocate[idx]
-            for actor_num in range(num_actors):
-
+            cpu_allocate = 1 if idx == 0 else 4
+            bundle_allocate = [0, 0, 1]
+            
+            # 创建多个actor
+            for actor_num in range(actor_allocate[idx]):
                 actor = ComputeActor.options(
                     name=f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
-                    # num_gpus=0.5 if op.use_cuda() else 0,
                     num_gpus=gpu_allocate,
                     num_cpus=cpu_allocate,
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=self.gpu_pg,
                         placement_group_capture_child_tasks=True
                     ),
-                    # placement_group_bundle_index=0,
+                    placement_group_bundle_index=bundle_allocate[idx],
                     runtime_env={
                         "env_vars": {"CUDA_VISIBLE_DEVICES": "0,1"} if op.use_cuda() else {},
-                        # "nsight": {
-                        #     "t": "cuda,nvtx,osrt",
-                        #     "cuda-memory-usage": "true",
-                        #     "stats": "true",
-                        #     "cuda-graph-trace": "graph",
-                        # }
                     }
                 ).remote(op, batch_size)
                 actors[op._name].append(actor)
-        
+        operators = operators[-2:]
+        # 打印所有actor信息
+        for op._name, actor_list in actors.items():
+            logger.info(f"Operator {op._name} 有以下actors:")
+            for i, actor in enumerate(actor_list):
+                logger.info(f"  Actor {i}: {actor._ray_actor_id.hex()[:6]}")
+
+
         op_indices = {op_name: 0 for op_name in actors.keys()}
 
         def get_next_actor(op_name):
@@ -249,9 +259,11 @@ class RayDataset(DJDataset):
             idx = op_indices[op_name]
             op_indices[op_name] = (idx + 1) % len(actor_list)
             return actor_list[idx]
-
+        
+        # 准备数据批次
         input_batches = list(self.data.iter_batches(batch_size=batch_size, batch_format="pyarrow"))
-        print(f"Total batches generated: {len(input_batches)}")
+        logger.info(f"Total batches generated: {len(input_batches)}")
+        logger.info(f"input batches: {input_batches}")  # List of pyarrow.Table
 
         futures = []
         buckets = defaultdict(list)
@@ -501,9 +513,11 @@ class RayDataset(DJDataset):
             return []
 
         table = pyarrow.Table.from_pylist(flattened_bucket)
-        
+        logger.info("table type  :", type(table))
+        logger.info("table :",table)
         # 根据操作类型调用不同的actor方法
         if isinstance(op, Filter):
+            
             ref = actor.process_and_filter.remote(table)
         elif isinstance(op, Mapper):
             ref = actor.mapper.remote(table)
@@ -514,6 +528,7 @@ class RayDataset(DJDataset):
         buckets[op_idx] = []
         return [ref]
 
+    
     def merge_tables_to_one_row(self, all_batches: list[pa.Table]) -> pa.Table:
         # 把每个 Table 转为 List[Dict]
         tables_as_dicts = [tbl.to_pylist() for tbl in all_batches]
@@ -652,9 +667,12 @@ class RayDataset(DJDataset):
                         batch_format="pyarrow",
                     )
                 else:
+                    logger.info(f"{op._name} map_batches with {num_gpus} gpus ~")
                     self.data = self.data.map_batches(
                         op.process, batch_size=batch_size, batch_format="pyarrow", num_gpus=num_gpus
                     )
+                    logger.info(f"type : {type(self.data)}")
+                    logger.info("self.data:", self.data)
             elif isinstance(op, Filter):
                 columns = self.data.columns()
                 if Fields.stats not in columns:

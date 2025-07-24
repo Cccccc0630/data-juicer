@@ -206,79 +206,68 @@ class VideoAestheticsFilter(Filter):
         return model, processor
     
     def compute_stats_batched(self, samples, rank=None, context=False):
-        # print('Computing aesthetics scores for batch of samples')
         print("samples type:", type(samples))
         print("samples:", samples)
         # 检查是否已经计算过
         if StatsKeys.video_frames_aesthetics_score in samples[Fields.stats]:
             print('Aesthetics scores already computed, returning samples')
             return samples
-        model , processor = self.load_model(rank=rank)
+
+        model, processor = self.load_model(rank=rank)
         device = model.device
 
         keys = samples.keys()
         num_samples = len(samples[Fields.stats])
-        # print(samples)
-        # print(f'[DEBUG] Total samples to process: {num_samples}')
 
         reconstructed_samples = [{key: samples[key][i] for key in keys} for i in range(num_samples)]
-        # print(f'[DEBUG] Reconstructed samples: {reconstructed_samples}')
         video_tasks = []
         for sample_idx, sample in enumerate(reconstructed_samples):
             if self.video_key not in sample or not sample[self.video_key]:
                 continue
             for vid_key in sample[self.video_key]:
-                
                 video_tasks.append({
                     'sample_index': sample_idx,
                     'vid_key': vid_key,
                     'sample': sample,
                 })
-        # print(f'[DEBUG] Total video tasks: {len(video_tasks)}')
+
         if not video_tasks:
             return samples
-        # logger.info("Start frame extraction ")
+
         start = time.time()
         def extract_frames(task: Dict) -> Tuple[str, Dict]:
             vid_key = task.get('vid_key', '')
-            # print(f"Video path exists: {os.path.exists(vid_key)}")
             if not vid_key:
                 return vid_key, {'frames': [], 'size': (0, 0)}
-            
+
             for attempt in range(3):
                 try:
                     dummy_sample = {self.video_key: [vid_key]}
                     _, videos = load_data_with_context(dummy_sample, False, [vid_key], load_video)
-                    # print(f"videos type: {type(videos)}")  # Debug videos type
-                    # print(f"videos keys: {videos.keys()}")  # Debug videos keys
-                    # print(f"videos content: {videos}")  # Debug videos content
                     video = videos.get(vid_key) if videos else None
-                    # print(f"video type: {type(video)}")  # Debug video type
                     if video is None:
                         return vid_key, {'frames': [], 'size': (0, 0)}
-                    
+
                     if self.frame_sampling_method == 'all_keyframes':
                         frames, size = extract_key_frames(video)
                     elif self.frame_sampling_method == 'uniform':
                         frames, size = extract_video_frames_uniformly(video, self.frame_num)
-                        # print(f"extract_video_frames_uniformly returned - frames type: {type(frames)}, size: {size}")
                     else:
                         frames = []
                         size = (0, 0)
                     close_video(video)
 
-                    return vid_key,{
-                        'raw_frames':[(f, size) for f in frames],
+                    return vid_key, {
+                        'raw_frames': [(f, size) for f in frames],
                         'size': size
                     }
                 except Exception as e:
                     logger.error(f"Error extracting frames for {vid_key}: {e}")
                     time.sleep(1)
             return vid_key, {'frames': [], 'size': (0, 0)}
-        
+
         cpu_count = os.cpu_count() or 4
         max_workers = max(2, min(int(cpu_count * 0.75), 64))
-        max_workers = 64
         video_frame_cache = {}
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(extract_frames, task): task['vid_key'] for task in video_tasks}
@@ -302,17 +291,13 @@ class VideoAestheticsFilter(Filter):
                         }
                     )
 
-        # logger.info("Start batching inference")
         start = time.time()
         for size, frame_items in size_to_frames.items():
-            # Process each batch of frames
-            # logger.info(f"Processing batch for size {size}: {frame_items}")
             if not frame_items or size == (0, 0):
                 continue
 
             batch_size = 512
             i = 0
-            
             while i < len(frame_items):
                 try:
                     batch_result = self._safe_batch_inference(
@@ -326,7 +311,11 @@ class VideoAestheticsFilter(Filter):
                         item = frame_items[i + j]
                         sample_idx = item['sample_index']
                         stats = reconstructed_samples[sample_idx][Fields.stats]
-                        stats.setdefault(StatsKeys.video_frames_aesthetics_score, []).append(score)
+                        video_key = item['vid_key']
+                        
+                        # 为每个视频单独存储分数
+                        stats.setdefault(StatsKeys.video_frames_aesthetics_score, {})[video_key] = score
+
                     i += batch_size
                 except Exception as e:
                     if 'CUDA out of memory' in str(e):
@@ -335,51 +324,74 @@ class VideoAestheticsFilter(Filter):
                         torch.cuda.empty_cache()
                         continue
                     raise
-        torch.cuda.synchronize()
-        # logger.info(f"Batch inference completed in {time.time() - start:.2f} seconds")
 
+        torch.cuda.synchronize()
+
+        # 计算每个视频的最终得分
         for sample in reconstructed_samples:
             stats = sample.get(Fields.stats, {})
-            scores = stats.get(StatsKeys.video_frames_aesthetics_score, [])
-
-            if not scores:
-                stats[StatsKeys.video_frames_aesthetics_score] = np.array([], dtype=np.float64)
-                continue
-            if self.need_normalized_by_ten:
-                scores = [score / 10.0 for score in scores]
-            if self.reduce_mode == 'avg':
-                result = np.mean(scores)
-            elif self.reduce_mode == 'max':
-                result = np.max(scores)
-            elif self.reduce_mode == 'min': 
-                result = np.min(scores)
+            video_scores = stats.get(StatsKeys.video_frames_aesthetics_score, {})
             
-            stats[StatsKeys.video_frames_aesthetics_score] = np.array(
-                [result], dtype=np.float64)
-
+            # 为每个视频创建帧得分列表
+            new_video_scores = {}
+            for video_key, scores in video_scores.items():
+                if not scores:
+                    new_video_scores[video_key] = []
+                    continue
+                
+                # 将分数转换为列表形式
+                if isinstance(scores, (float, np.floating)):
+                    score_list = [float(scores)]
+                elif isinstance(scores, (list, np.ndarray)):
+                    score_list = [float(s) for s in scores]
+                else:
+                    score_list = []
+                
+                # 应用归一化（如果需要）
+                if self.need_normalized_by_ten:
+                    score_list = [s/10.0 for s in score_list]
+                
+                new_video_scores[video_key] = score_list
+            
+            # 更新stats中的分数
+            stats[StatsKeys.video_frames_aesthetics_score] = new_video_scores
+            sample[Fields.stats] = stats
 
         torch.cuda.empty_cache()
         logger.info(f"[Rank {device}] Peak Memory: Allocated={torch.cuda.max_memory_allocated(device) / (1024 ** 3):.2f} GB, Reserved={torch.cuda.max_memory_reserved(device) / (1024 ** 3):.2f} GB")
-        
-        long_dict = {
-            'videos': [],
-            'text': [],
-            'video_frames_aesthetics_score': [],
-            '__dj__source_file__': []
-        }
-
-        for sample in reconstructed_samples:
-            long_dict['videos'].append(sample['videos'][0])
-            long_dict['text'].append(sample['text'])
-            long_dict['video_frames_aesthetics_score'].append(sample['__dj__stats__']['video_frames_aesthetics_score'])
-            # 添加 __dj__source_file__ 字段
-            if '__dj__source_file__' in sample:
-                long_dict['__dj__source_file__'].append(sample['__dj__source_file__'])
+        # print("\nreconstructed_samples with frame scores:", reconstructed_samples)
+        return self.expand_video_records(reconstructed_samples)
+        return reconstructed_samples
+    
+    def expand_video_records(self, records):
+        expanded = []
+        for record in records:
+            videos = record['videos']
+            n_videos = len(videos)
+            
+            # 获取美学评分（确保顺序与videos一致）
+            aesthetics_scores = record['__dj__stats__']['video_frames_aesthetics_score']
+            score_list = [aesthetics_scores[vid][0] for vid in videos]  # 取出每个视频的评分
+            
+            # 获取源文件（处理可能的1对多情况）
+            source_files = record['__dj__source_file__']
+            if len(source_files) == n_videos:
+                source_list = source_files
             else:
-                # 如果原始样本中没有这个字段，添加一个空值或默认值
-                long_dict['__dj__source_file__'].append(None)
-
-        return long_dict
+                source_list = [source_files[0]] * n_videos  # 如果源文件数量不匹配，使用第一个
+                
+            # 为每个视频创建独立记录
+            for i in range(n_videos):
+                new_record = {
+                    'videos': videos[i],
+                    'text': record['text'],
+                    '__dj__stats__': {
+                        'video_frames_aesthetics_score': {videos[i]: [score_list[i]]}
+                    },
+                    '__dj__source_file__': source_list[i]
+                }
+                expanded.append(new_record)
+        return expanded
     
     def _safe_batch_inference(self, model, processor, batch_items, device):
         batch_frames = []
@@ -404,32 +416,75 @@ class VideoAestheticsFilter(Filter):
         }
     
     def process_batched(self, batch):
+        """
+        批量处理视频样本，基于美学评分进行过滤
         
-        stats_list = batch[Fields.stats]  # List[dict]
-        aesthetics_scores_batch = [
-            stats[StatsKeys.video_frames_aesthetics_score]
-            for stats in stats_list
-        ]
-        keep_bools_batch = []
+        参数:
+            batch: {
+                'videos': List[str], 
+                'text': List[str],
+                '__dj__stats__': List[dict],  # 包含 video_frames_aesthetics_score
+                '__dj__source_file__': List[str]
+            }
+            
+        返回:
+            List[bool]: 每个样本是否保留的决策列表
+        """
+        # 提取统计信息列表
+        stats_list = [sample.get(Fields.stats, {}) for sample in batch]
+        
+        # 准备批量处理数据
+        keep_decisions = []
+        print(f"\n[Batch Processing] Analyzing {len(stats_list)} videos")
+        print(f"Score range: [{self.min_score}, {self.max_score}]")
+        print(f"Filter strategy: {'ANY' if self.any else 'ALL'} frame must pass\n")
 
-        for idx, aesthetics_scores in enumerate(aesthetics_scores_batch):
-            # print(f"[Debug] Sample {idx} - aesthetics_scores: {aesthetics_scores}")
-            if len(aesthetics_scores) <= 0:
-                keep_bools_batch.append(True)
+        for idx, stats in enumerate(stats_list):
+            # 获取当前视频的所有帧评分（字典形式：{视频路径: [评分]}）
+            video_scores_dict = stats.get(StatsKeys.video_frames_aesthetics_score, {})
+            
+            # 合并所有帧评分（展平为列表）
+            all_scores = []
+            for video_path, scores in video_scores_dict.items():
+                if isinstance(scores, (list, np.ndarray)):
+                    all_scores.extend([float(s) for s in scores])
+                elif isinstance(scores, (float, int)):
+                    all_scores.append(float(scores))
+            
+            debug_info = f"Video {idx} - {batch[idx]['videos']} - Scores: {all_scores} -> "
+            
+            # 空值处理
+            if not all_scores:
+                keep_decisions.append(True)
+                debug_info += "KEPT (no scores)"
+                print(debug_info)
                 continue
 
-            keep_bools = np.array([
-                self.min_score <= aesthetics_score <= self.max_score
-                for aesthetics_score in aesthetics_scores
+            # 范围检查
+            score_checks = np.array([
+                self.min_score <= score <= self.max_score 
+                for score in all_scores
             ])
-
-            # different strategies
+            
+            # 应用过滤策略
             if self.any:
-                keep_bools_batch.append(keep_bools.any())
+                decision = score_checks.any()
+                debug_info += f"ANY valid? {decision}"
+                if not decision:
+                    debug_info += f" (all {len(all_scores)} scores out of range)"
             else:
-                keep_bools_batch.append(keep_bools.all())
+                decision = score_checks.all()
+                debug_info += f"ALL valid? {decision}"
+                if not decision:
+                    invalid_indices = np.where(~score_checks)[0]
+                    invalid_scores = [all_scores[i] for i in invalid_indices]
+                    debug_info += f" ({len(invalid_indices)} invalid: {invalid_scores})"
+            
+            keep_decisions.append(decision)
+            print(debug_info)
 
-        return keep_bools_batch
+        print(f"\nFinal decisions: {keep_decisions}")
+        return keep_decisions
 
     def process_single(self, sample):
 

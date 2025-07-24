@@ -9,7 +9,7 @@ import ray
 import torch
 import pyarrow
 import pyarrow as pa 
-
+import numpy as np
 from loguru import logger
 
 
@@ -165,26 +165,27 @@ class ComputeActor:
                 else:
                     print(f"Warning: Skipping record {i}, unexpected type: {type(record)}")
             print(f"Total records after conversion: {len(std_records)}")
-            new_std_records = []
-            # 现在使用std_records进行后续处理
-            for record in std_records:
-                # print("\nrecord:  ", record)
-                if record.get('videos'):
-                    # 兼容三层和两层嵌套
-                    if isinstance(record['videos'][0][0], list):
-                        videos = [v[0][0] for v in record['videos']]
-                    else:
-                        videos = [record['videos'][0][0]]
+            # print(f"Total records after conversion: {std_records}")
+            new_std_records = std_records
+            # # 现在使用std_records进行后续处理
+            # for record in std_records:
+            #     # print("\nrecord:  ", record)
+            #     if record.get('videos'):
+            #         # 兼容三层和两层嵌套
+            #         if isinstance(record['videos'][0][0], list):
+            #             videos = [v[0][0] for v in record['videos']]
+            #         else:
+            #             videos = [record['videos'][0][0]]
 
-                text = record['text'][0] if isinstance(record['text'], list) else record['text']
+            #     text = record['text'][0] if isinstance(record['text'], list) else record['text']
 
-                new_std_record = {
-                    "videos": videos,
-                    "text": text,
-                    "__dj__stats__": record.get("__dj__stats__", {}),
-                    "__dj__source_file__": record.get("__dj__source_file__", "")
-                }
-                new_std_records.append(new_std_record)
+            #     new_std_record = {
+            #         "videos": videos,
+            #         "text": text,
+            #         "__dj__stats__": record.get("__dj__stats__", {}),
+            #         "__dj__source_file__": record.get("__dj__source_file__", "")
+            #     }
+            #     new_std_records.append(new_std_record)
 
             # 3. 准备批量处理数据
             samples = {
@@ -197,42 +198,68 @@ class ComputeActor:
             # 4. 执行统计计算
             stats_records = self.op.compute_stats_batched(samples)
             # print(f"\n\nComputed stats: {stats_records.keys()}")
-
+            # print("\n stats_records", stats_records)
             # 5. 构建过滤用的数据结构
-            converted_batch = {
-                Fields.stats: [
-                    {
-                        StatsKeys.video_frames_aesthetics_score: score,
-                        StatsKeys.video_duration: duration
-                    }
-                    for score, duration in zip(
-                        stats_records[StatsKeys.video_frames_aesthetics_score],
-                        stats_records.get(StatsKeys.video_duration, [0]*len(stats_records[StatsKeys.video_frames_aesthetics_score]))
-                    )
-                ]
-            }
-
+            # converted_batch = {
+            #     Fields.stats: [
+            #         {
+            #             StatsKeys.video_frames_aesthetics_score: score,
+            #             StatsKeys.video_duration: duration
+            #         }
+            #         for score, duration in zip(
+            #             stats_records[StatsKeys.video_frames_aesthetics_score],
+            #             stats_records.get(StatsKeys.video_duration, [0]*len(stats_records[StatsKeys.video_frames_aesthetics_score]))
+            #         )
+            #     ]
+            # }
+            # converted_batch = {
+            #     Fields.stats: [
+            #         {
+            #             StatsKeys.video_frames_aesthetics_score: list(record['__dj__stats__']['video_frames_aesthetics_score'].values())[0],
+            #             "__dj__source_file__": record['__dj__source_file__']
+            #         }
+            #         for record in stats_records
+            #     ],
+            #     "videos": [record['videos'] for record in stats_records],
+            #     "text": [record['text'] for record in stats_records]
+            # }
+            # print("stats_records::", stats_records)
             # 6. 执行过滤
-            keep_flags = self.op.process_batched(converted_batch)
-
-            filtered_records = [
-                {
-                    "videos": [[stats_records["videos"][i]]],
-                    "text": stats_records["text"][i],
-                    "aesthetics_score": stats_records[StatsKeys.video_frames_aesthetics_score][i],
-                    # "video_duration": stats_records.get(StatsKeys.video_duration, [0]*len(stats_records[StatsKeys.video_frames_aesthetics_score]))[i],
-                    # "__dj__stats__": stats_records["__dj__stats__"][i],
-                    # "__dj__source_file__": stats_records["__dj__source_file__"][i]
+            keep_flags = self.op.process_batched(stats_records)
+            # keep_flags = self.op.process_batched(converted_batch)
+            # print("(keep_flags):", keep_flags)
+            filtered_records = []
+            for i, keep in enumerate(keep_flags):
+                if not keep:
+                    continue
+                    
+                record = stats_records[i]
+                
+                # 获取所有视频帧的评分（展平处理）
+                video_scores = []
+                for path, scores in record['__dj__stats__']['video_frames_aesthetics_score'].items():
+                    if isinstance(scores, (list, np.ndarray)):
+                        video_scores.extend([float(s) for s in scores])
+                    elif isinstance(scores, (float, int)):
+                        video_scores.append(float(scores))
+                
+                # 构建新记录
+                new_record = {
+                    "videos": [[record['videos']]] if isinstance(record['videos'], str) else [record['videos']],
+                    "text": record['text'],
+                    "aesthetics_score": video_scores,
+                    "__dj__stats__": record['__dj__stats__'],
+                    "__dj__source_file__": record['__dj__source_file__']
                 }
-                for i, keep in enumerate(keep_flags) if keep
-            ]
-            # 7. 返回结果
+                filtered_records.append(new_record)
+            
+            # 2. 检查并返回结果
             if not filtered_records:
                 print("No records passed the filter")
                 return None
             result = pyarrow.Table.from_pylist(filtered_records)
-            # print("Filtered records schema:", result.schema)
-            # print(result)
+            print("Filtered records schema:", result.schema)
+            print(f"Kept {len(filtered_records)}/{len(stats_records)} records")
             return result
 
         except Exception as e:
