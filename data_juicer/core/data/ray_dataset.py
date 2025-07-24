@@ -195,12 +195,7 @@ class RayDataset(DJDataset):
         actors = {}
         actor_allocate = [0, 1, 1]  # 每个operator分配的actor数量
         # actors = []
-        op1 = operators[0] 
-        # split
-        logger.info("Video cliping")
-        self.data = self.data.map_batches(
-                    op1.process, batch_size=1, batch_format="pyarrow", num_gpus=0
-                )
+        
         # if self.data is not None:
         #     logger.info("data type after clip:",self.data)
         
@@ -217,7 +212,13 @@ class RayDataset(DJDataset):
                     return new_table
                 self.data = self.data.map_batches(process_batch_arrow, batch_format='pyarrow')
             
-            
+            if idx == 0 :
+                # split
+                logger.info("Video cliping")
+                self.data = self.data.map_batches(
+                            op.process, batch_size=1, batch_format="pyarrow", num_gpus=0
+                        )
+                continue
             
             # 设置batch size
             batch_size = 15 if op.is_batched_op() else 1
