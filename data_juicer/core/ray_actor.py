@@ -11,6 +11,9 @@ import pyarrow
 import pyarrow as pa 
 import numpy as np
 from loguru import logger
+import pytz
+from datetime import datetime
+beijing_tz = pytz.timezone('Asia/Singapore')
 
 
 # @ray.remote(num_gpus=0.0, runtime_env={ "nsight": "default" })  # 注意：Ray不占GPU配额，由你手动控制
@@ -110,18 +113,35 @@ def flatten_records(records):
 class ComputeActor:
     def __init__(self, op, batch_size, rank=None):
         """
-        现在直接传入整个op对象，更灵活控制流程
+        初始化 Actor，但不自动加载模型（改为显式调用 load_model）
         """
         self.op = op
         self.batch_size = batch_size
         self.call_count = 0
-        # print(f"[Actor] Initialized with op: {self.op._name}, batch_size: {self.batch_size}")
-        if op.use_cuda():
+        self._model_loaded = False  # 标记模型是否已加载
+        self.rank = rank
+        self.load_task = None  # 用于存储异步加载模型任务的引用
+    
+    def load_model(self):
+        """显式加载模型（供外部调用）"""
+        if self.op.use_cuda() and not self._model_loaded:
             start = time.time()
-            self.op.load_model(rank=rank)
-            print(f"[Actor] {self.op._name} Model loaded in {time.time() - start:.3f} seconds from {start} to {time.time()}")
-
+            start_time = datetime.fromtimestamp(start, pytz.utc).astimezone(beijing_tz)
+            self.op.load_model(rank=self.rank)
+            end = time.time()
+            end_time = datetime.fromtimestamp(end, pytz.utc).astimezone(beijing_tz)
+            self._model_loaded = True
+            
+            print(
+                f"[Actor] {self.op._name} Model loaded in {end - start:.3f} seconds "
+                f"from {start_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"to {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        return True
+    
     def process_and_filter(self, batch: pyarrow.Table) -> pyarrow.Table:
+        if not self._model_loaded:
+            self.load_model()  # 确保调用前模型已加载
         # print(f"\nbatch!!!!!: {batch}\n")
         # print(f"[Actor Debug] Processing batch with {len(batch)} rows")
         self.call_count += 1
@@ -258,8 +278,8 @@ class ComputeActor:
                 print("No records passed the filter")
                 return None
             result = pyarrow.Table.from_pylist(filtered_records)
-            print("Filtered records schema:", result.schema)
-            print(f"Kept {len(filtered_records)}/{len(stats_records)} records")
+            # print("Filtered records schema:", result.schema)
+            # print(f"Kept {len(filtered_records)}/{len(stats_records)} records")
             return result
 
         except Exception as e:
@@ -268,6 +288,8 @@ class ComputeActor:
             raise
     
     def mapper(self, batch: Union[pa.Table, List[Dict]]) -> pa.Table:
+        if not self._model_loaded:
+            self.load_model()  # 确保调用前模型已加载
         try:
             # === Step 1: 统一成 list[dict] ===
             if isinstance(batch, pa.Table):
@@ -358,11 +380,13 @@ class ComputeActor:
 
 
     def mapper_single(self, batch: pyarrow.Table) -> pyarrow.Table:
+        if not self._model_loaded:
+            ray.get(self.load_model().remote())
         try:
             # print(batch)
             # 1. 原始转换
             records = convert_record(batch, root_path="/home/xcy")
-            print("\n\n")
+            # print("\n\n")
             # print("records after convert:", records)
             records = flatten_records(records)
             # 2. 处理记录
@@ -388,9 +412,9 @@ class ComputeActor:
             
 
             result = pyarrow.Table.from_pylist(standardized_records)
-            print("Split records schema:", result.schema)
+            # print("Split records schema:", result.schema)
             # 4. 转换为PyArrow Table
-            print(result)
+            # print(result)
             return result
 
         except Exception as e:
@@ -432,3 +456,16 @@ class ComputeActor:
 
         # 返回格式统一后的表
         return pa.table(columns)
+    
+@ray.remote(num_gpus=0.0) 
+class ProcessActor:
+    def __init__(self, op, batch_size):
+
+        self.op = op
+        self.batch_size = batch_size
+        self.call_count = 0
+
+    def process(self, data):
+        return data.map_batches(
+            self.op.process, batch_size=self.batch_size, batch_format="pyarrow", num_gpus=0
+        )
