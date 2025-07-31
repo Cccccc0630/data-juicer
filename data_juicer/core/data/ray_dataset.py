@@ -1,28 +1,19 @@
 from __future__ import annotations
-from itertools import chain
 import queue
 import threading
-import warnings
 
-from data_juicer.core.actor import Actor
-# 忽略所有 Matplotlib 字体相关的警告
-warnings.filterwarnings("ignore", category=UserWarning, module="matplotlib.font_manager")
-from collections import defaultdict
-from concurrent import futures
-import json
-import logging
+
 import os
 # os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 from argparse import Namespace
 from functools import partial
-import subprocess
+
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
 import uuid
 os.environ["RAY_DEDUP_LOGS"] = "1"
-from data_juicer.core.ray_actor import ComputeActor, ProcessActor, filter_batch
+from data_juicer.core.ray_actor import Actor, ComputeActor, ProcessActor, filter_batch
 import pyarrow
-import pyarrow as pa    
 import ray.data as rd
 import ray.data.read_api as ds
 from loguru import logger
@@ -34,9 +25,7 @@ from data_juicer.ops import Deduplicator, Filter, Mapper
 from data_juicer.ops.base_op import TAGGING_OPS
 from data_juicer.utils.constant import Fields
 from data_juicer.utils.process_utils import calculate_np
-import pytz
-from datetime import datetime
-beijing_tz = pytz.timezone('Asia/Singapore')
+
 import ray
 from ray.util.placement_group import (
     placement_group,
@@ -120,10 +109,6 @@ class RayDataset(DJDataset):
         self.num_proc = getattr(cfg, 'np', getattr(cfg, 'num_proc', None)) if cfg else None
         self.gpu_pg = placement_group([{"CPU": 16, "GPU": 2}], strategy="STRICT_SPREAD")
         ray.get(self.gpu_pg.ready())
-        
-        # 初始化MPS管理器
-        # self.mps_manager = MPSManager()
-        # self.mps_manager.init_mps()
 
     def schema(self) -> Schema:
         """Get dataset schema.
@@ -226,46 +211,52 @@ class RayDataset(DJDataset):
             self.data = self.data.map_batches(process_batch_arrow, batch_format="pyarrow")
 
         actors = {}
-
+        # 资源分配
+        gpu_allocate = [0,1,1]
+        actor_allocate = [0,1,1]
+        cpu_allocate = 1
+        bundle_allocate = [0, 0, 0]
         for idx, op in enumerate(operators):
             op_proc = calculate_np(op._name, op.mem_required, op.cpu_required, self.num_proc, op.use_cuda())
             actors[op._name] = []
-
-            # 资源分配
-            gpu_allocate = 1
-            cpu_allocate = 4
-            bundle_allocate = [0, 0, 0]
-
+            
+            if  actor_allocate[idx] > 0 :
+                actor_num = actor_allocate[idx] 
+            else:
+                actor_num = min(op_proc, self.data.count())
             if op.use_cuda():
-                num_gpus = get_num_gpus(op, op_proc)
+                num_gpus = gpu_allocate[idx]
                 print(f"{op._name} allocate {num_gpus} GPUs.")
 
-                actor = Actor.options(
-                name=f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
-                num_gpus=num_gpus,
-                num_cpus=cpu_allocate,
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=self.gpu_pg,
-                    placement_group_capture_child_tasks=True
-                ),
-                placement_group_bundle_index=bundle_allocate[idx],
-            ).remote(op)
-                
-                actor.load_model.remote()
+                for _ in range(actor_num):  # 启动多个actor
+                    actor = Actor.options(
+                        name=f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
+                        num_gpus=num_gpus,
+                        num_cpus=cpu_allocate,
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=self.gpu_pg,
+                            placement_group_capture_child_tasks=True
+                        ),
+                        placement_group_bundle_index=bundle_allocate[idx],
+                    ).remote(op)
+                    
+                    actor.load_model.remote()
+                    actors[op._name].append(actor)
             else:
                 num_gpus = 0
                 print(f"{op._name} allocate in CPU.")
-                actor = Actor.options(
-                    name=f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
-                    num_gpus=num_gpus,
-                    num_cpus=cpu_allocate,
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=self.gpu_pg,
-                        placement_group_capture_child_tasks=True
-                    ),
-                    placement_group_bundle_index=bundle_allocate[idx],
-                ).remote(op)
-            actors[op._name].append(actor)
+                for _ in range(actor_num):  # 启动多个actor
+                    actor = Actor.options(
+                        name=f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
+                        num_gpus=num_gpus,
+                        num_cpus=cpu_allocate,
+                        scheduling_strategy=PlacementGroupSchedulingStrategy(
+                            placement_group=self.gpu_pg,
+                            placement_group_capture_child_tasks=True
+                        ),
+                        placement_group_bundle_index=bundle_allocate[idx],
+                    ).remote(op)
+                    actors[op._name].append(actor)
 
         # 打印所有actor信息
         for op_name, actor_list in actors.items():
@@ -280,20 +271,24 @@ class RayDataset(DJDataset):
         for data_item in input_data:
             op_buckets[operators[0]._name].put(data_item)
 
-        # 添加结束标记，用于通知pipeline结束
-        op_buckets[operators[0]._name].put(None)  # None作为结束标记
+        # 添加结束标记，数量等于第一个operator的actor数量
+        for _ in range(len(actors[operators[0]._name])):
+            op_buckets[operators[0]._name].put(None)
 
         # 存储每个操作的处理结果
         final_results = []
         # 为每个操作创建事件
         events = {op._name: threading.Event() for op in operators}
-
         # 将第一个操作的事件标记为已触发
         events[operators[0]._name].set()
-        def process_operator(op_idx, op):
-            # 每个operator的处理函数，在独立线程中运行
+
+        # 用于跟踪每个operator的完成情况
+        op_completion_count = {op._name: 0 for op in operators}
+        # 用于同步同一operator的多个actor
+        op_actor_locks = {op._name: threading.Lock() for op in operators}
+
+        def process_operator(op_idx, op, actor):
             op_name = op._name
-            actor = actors[op_name][0]
             input_queue = op_buckets[op_name]
             
             # 确定输出队列
@@ -316,24 +311,31 @@ class RayDataset(DJDataset):
                     
                     # 检查结束标记
                     if data_item is None:
-                        # logger.info(f"{op_name} actor {actor._ray_actor_id.hex()[:6]} received end marker")
-                        # 传递结束标记到下一个队列
-                        if output_queue:
-                            output_queue.put(None)
+                        with op_actor_locks[op_name]:
+                            op_completion_count[op_name] += 1
+                            # 当所有actor都收到结束标记后，才传递到下一个队列
+                            if op_completion_count[op_name] == len(actors[op_name]) and output_queue:
+                                # 向下一个operator传递与下一个operator的actor数量相同的结束标记
+                                next_op_name = operators[op_idx + 1]._name if op_idx + 1 < len(operators) else None
+                                if next_op_name:
+                                    for _ in range(len(actors[next_op_name])):
+                                        output_queue.put(None)
                         break
-                    
-                    # logger.info(f"{op_name} actor {actor._ray_actor_id.hex()[:6]} processing data item: {data_item}")
                     
                     # 处理数据
                     future = None
                     if isinstance(op, Mapper):
                         if op.use_cuda():
-                            future = actor.mapper_cuda.remote(data_item)  
+                            if op.is_batched_op:
+                                future = actor.mapper_cuda_batched.remote(self.transform_to_2d_format(data_item))
+                                
+                            else:
+                                future = actor.mapper_cuda.remote(data_item)  
                         else:
                             future = actor.mapper_cpu.remote(data_item)  
                         
                         result = ray.get(future)
-                        
+
                         # 将结果发送到下一个队列
                         if output_queue:
                             output_queue.put(result)
@@ -348,7 +350,6 @@ class RayDataset(DJDataset):
                         
                         results = ray.get(future)
                         
-                        # Filter可能返回空结果或多个结果
                         if results:
                             if isinstance(results, list):
                                 for result in results:
@@ -374,7 +375,6 @@ class RayDataset(DJDataset):
 
                 except queue.Empty:
                     logger.info(f"{op_name} actor {actor._ray_actor_id.hex()[:6]} queue timeout, checking if pipeline is complete")
-                    # 检查是否还有其他线程在工作
                     continue
                 except Exception as e:
                     logger.error(f"Error in {op_name} actor {actor._ray_actor_id.hex()[:6]}: {e}")
@@ -384,30 +384,25 @@ class RayDataset(DJDataset):
             end_time = time.time()
             logger.info(f"Processor for {op_name} actor {actor._ray_actor_id.hex()[:6]} completed in {end_time - start_time:.2f} seconds")
 
-        # 为每个operator启动处理线程
+        # 为每个operator的每个actor启动处理线程
         threads = []
         for idx, op in enumerate(operators):
-            thread = threading.Thread(
-                target=process_operator, 
-                args=(idx, op),
-                name=f"processor_{op._name}"
-            )
-            thread.daemon = True
-            thread.start()
-            threads.append(thread)
+            for actor in actors[op._name]:
+                thread = threading.Thread(
+                    target=process_operator, 
+                    args=(idx, op, actor),
+                    name=f"processor_{op._name}_{actor._ray_actor_id.hex()[:6]}"
+                )
+                thread.daemon = True
+                thread.start()
+                threads.append(thread)
 
         # 等待所有线程完成
         for thread in threads:
             thread.join()
 
-        # print(f"Pipeline processing complete. Final results: {len(final_results)}")
-        # print("res:\n", final_results)
-        flattened_data = list(chain.from_iterable(final_results))
-        self.data = from_items(flattened_data)
-        # self.data.show()
+        self.data = from_items(final_results)
         return self.data
-
-
 
     @classmethod
     def read(cls, data_format: str, paths: Union[str, List[str]]) -> RayDataset:

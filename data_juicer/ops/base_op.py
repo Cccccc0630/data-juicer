@@ -1,14 +1,19 @@
 import copy
 from functools import wraps
+import time
 
 import numpy as np
 import pyarrow as pa
 from loguru import logger
 
+import pytz
+from datetime import datetime
+beijing_tz = pytz.timezone('Asia/Singapore')
+
 from data_juicer import is_cuda_available
 from data_juicer.utils.constant import Fields
 from data_juicer.utils.mm_utils import size_to_bytes
-from data_juicer.utils.model_utils import free_models
+from data_juicer.utils.model_utils import free_models, get_model
 from data_juicer.utils.process_utils import calculate_np
 from data_juicer.utils.registry import Registry
 
@@ -285,7 +290,19 @@ class OP:
 
     def empty_history(self):
         return np.empty((0, 0), dtype=str)
-
+    
+    def load_model(self, rank=None):
+        start = time.time()
+        start_time = datetime.fromtimestamp(start, pytz.utc).astimezone(beijing_tz)
+        model, processor = get_model(self.model_key, rank=rank, use_cuda=self.use_cuda())
+        end = time.time()
+        end_time = datetime.fromtimestamp(end, pytz.utc).astimezone(beijing_tz)
+        print(
+                f"[Actor] {self._name} Model loaded in {end - start:.3f} seconds "
+                f"from {start_time.strftime('%Y-%m-%d %H:%M:%S')} "
+                f"to {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            )
+        return model, processor
 
 class Mapper(OP):
     def __init__(self, *args, **kwargs):
