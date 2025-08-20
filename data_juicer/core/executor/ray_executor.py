@@ -57,9 +57,20 @@ class RayExecutor(ExecutorBase):
 
         # init ray
         logger.info("Initializing Ray ...")
- 
+        # # 指定 nsys 的绝对路径
+        # nsys_path = "/opt/nvidia/nsight-systems/2024.6.1/bin"
+        # runtime_env = {
+        #     "nsight": {
+        #         "t": "cuda,cudnn,cublas,nvtx",  # 跟踪 CUDA/cuDNN/cuBLAS/NVTX
+        #         "o": "'worker_process_%p'",      # 输出文件名模板（含进程ID）
+        #         "stop-on-exit": "true",          # 进程退出时停止记录
+        #         "f": "true",
+        #         # "gpu-metrics-devices":"0",
+        #     },  
+        #     "env_vars": {"PATH": f"{nsys_path}:{os.environ.get('PATH', '')}"}
+        # }
         ray.init(self.cfg.ray_address, ignore_reinit_error=True)
-        
+        # ray.init(self.cfg.ray_address, ignore_reinit_error=True, runtime_env=runtime_env)
         self.tmp_dir = os.path.join(self.work_dir, ".tmp", ray.get_runtime_context().get_job_id())
 
         # absolute path resolution logic

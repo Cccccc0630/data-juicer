@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+import copy
 from datetime import datetime
 import os
 from functools import partial
@@ -9,6 +10,7 @@ import threading
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
 import uuid
+# from data_juicer.core.PipelineStrategist import PipelineStrategist
 import numpy
 from data_juicer.core.ray_actor import Actor
 import pyarrow
@@ -26,7 +28,7 @@ from data_juicer.utils.lazy_loader import LazyLoader
 from data_juicer.utils.process_utils import calculate_np
 from data_juicer.utils.webdataset_utils import _custom_default_decoder
 import ray
-ray = LazyLoader("ray")
+# ray = LazyLoader("ray")
 from ray.util.placement_group import (
     placement_group,
     placement_group_table,
@@ -105,8 +107,7 @@ class RayDataset(DJDataset):
     def __init__(self, dataset: ray.data.Dataset, dataset_path: str = None, cfg: Optional[Namespace] = None) -> None:
         self.data = preprocess_dataset(dataset, dataset_path, cfg)
         self.num_proc = getattr(cfg, "np", getattr(cfg, "num_proc", None)) if cfg else None
-        # self.gpu_pg = placement_group([{"CPU": 16, "GPU": 2}], strategy="STRICT_SPREAD")
-        # ray.get(self.gpu_pg.ready())
+        self.gpu_pg = None
 
     def schema(self) -> Schema:
         """Get dataset schema.
@@ -166,72 +167,126 @@ class RayDataset(DJDataset):
             self._run_single_op(op)
             self.data = self.data.materialize()
         return self
-    
-    
+
     def process_parallel(self, operators, *, exporter=None, checkpointer=None, tracer=None) -> DJDataset:
         if operators is None:
             return self
         if not isinstance(operators, list):
             operators = [operators]
-
         # 添加meta和stats列（如果需要）
-        add_meta = False
-        add_stats = False
-        for op in operators:
-            columns = self.data.columns()
-            if op._name in TAGGING_OPS.modules and Fields.meta not in self.data.columns():
-                add_meta = True
-            if isinstance(op, Filter):
-                if Fields.stats not in columns:
-                    add_stats = True
-
-        if add_meta:
-            def process_batch_arrow(table: pyarrow.Table):
-                new_column_data = [{} for _ in range(len(table))]
-                new_table = table.append_column(Fields.meta, [new_column_data])
-                return new_table
-
-            self.data = self.data.map_batches(process_batch_arrow, batch_format="pyarrow")
-
-        if add_stats:
-            def process_batch_arrow(table: pyarrow.Table):
-                new_column_data = [{} for _ in range(len(table))]
-                new_table = table.append_column(Fields.stats, [new_column_data])
-                return new_table
-
-            self.data = self.data.map_batches(process_batch_arrow, batch_format="pyarrow")
-
-        # Step 1: 创建所有 operator 的 actor
-        actors = {}
+        self.add_meta_stats_columns(operators)
+        last_filter_idx = -1
+        if self.has_splitOP(operators):
+            logger.info("Transforming split OP to Detect and Split.")
+            for idx, op in enumerate(operators):
+                if isinstance(op, Filter):
+                    last_filter_idx = idx
+        # 将Cut操作插入到最后一个Filter之后     
+        if last_filter_idx != -1:
+            cut_op = copy.deepcopy(operators[0])
+            cut_op._name = f"{operators[0]._name}_cut"
+            operators.insert(last_filter_idx + 1, cut_op) 
+            logger.info(f"Pipeline modified. New order: {[op._name for op in operators]}")           
+        # Step 1: 动态构建 Placement Group
+        # 计算需要多少个 CPU-only Actor 和多少个 GPU Actor
+        gpu_actor_configs = []
+        cpu_actor_count = 0
         for op in operators:
             op_proc = 1 if op.use_cuda() else calculate_np(op._name, op.mem_required, op.cpu_required, self.num_proc, op.use_cuda())
-            # actor_num = min(op_proc, self.data.count())
-            actor_num = op_proc
+            actor_num = min(op_proc, self.data.count()) # op.proc_num 应该是您计算出的进程数
+            if op.use_cuda():
+                for _ in range(actor_num):
+                    # 收集每个GPU actor所需的资源
+                    gpu_actor_configs.append({
+                        "cpu": op.cpu_required,
+                        "gpu": op.gpu_required, # 假设 op.gpu_required 是一个分数，例如 0.4
+                        "op_name": op._name
+                    })
+            else:
+                cpu_actor_count += actor_num
+
+        # 创建 PG bundles
+        bundles = []
+        # 1. 为所有 CPU Actor 创建一个大的共享 Bundle
+        if cpu_actor_count > 0:
+            # 假设每个 CPU actor 需要 1 个 CPU，可以根据实际情况调整
+            bundles.append({"CPU": cpu_actor_count * 1}) 
+        
+        cpu_bundle_index = 0 if cpu_actor_count > 0 else -1 # -1表示没有CPU bundle
+
+        # 2. 为每个 GPU Actor 创建一个独立的 Bundle
+        total_gpu_required = sum(conf['gpu'] for conf in gpu_actor_configs)
+        if total_gpu_required > 1.0:
+            # 动态调整GPU需求，使其总和不超过1，或者发出警告
+            # 这里我们采用按比例缩放
+            scaling_factor = 1.0 / total_gpu_required
+            logger.warning(f"Total GPU request ({total_gpu_required}) exceeds 1.0. Scaling down by a factor of {scaling_factor:.2f}.")
+            for conf in gpu_actor_configs:
+                conf['gpu'] *= scaling_factor
+        
+        for conf in gpu_actor_configs:
+            bundles.append({"CPU": conf['cpu'], "GPU": conf['gpu']})
+
+        # 创建并准备 Placement Group
+        if bundles:
+            self.gpu_pg = placement_group(bundles=bundles, strategy="STRICT_PACK")
+            ray.get(self.gpu_pg.ready())
+            logger.info(f"Placement Group created with {len(bundles)} bundles.")
+        # Step 2: 创建所有 operator 的 actor，并分配到正确的 Bundle
+        actors = {}
+        # GPU bundle 的索引从 cpu_bundle_index + 1 开始
+        gpu_bundle_idx_counter = cpu_bundle_index + 1
+        
+        # MPS 百分比分配，确保逻辑健壮
+        cuda_percentage_allocate = [10, 90] # 示例值
+
+        for op in operators:
+            op_proc = 1 if op.use_cuda() else calculate_np(op._name, op.mem_required, op.cpu_required, self.num_proc, op.use_cuda())
+            actor_num = min(op_proc, self.data.count())
             actors[op._name] = []
-
-            for _ in range(actor_num):
-                actor = Actor.options(
-                    name=f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
-                    num_gpus=op.gpu_required if op.use_cuda() else 0,
-                    num_cpus=op.cpu_required
-                ).remote(op)
-
+            
+            for idx in range(actor_num):
+                actor_options = {
+                    "name": f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
+                    "num_cpus": op.cpu_required
+                }
+                
                 if op.use_cuda():
-                    actor.load_model.remote()
+                    # 分配一个独立的 GPU bundle
+                    bundle_index = gpu_bundle_idx_counter
+                    gpu_bundle_idx_counter += 1
+                    
+                    # 分配 MPS 百分比
+                    # 使用 modulo 操作防止索引越界
+                    percentage = cuda_percentage_allocate[ (gpu_bundle_idx_counter - (cpu_bundle_index + 2)) % len(cuda_percentage_allocate) ]
 
-                actors[op._name].append(actor)
+                    actor_options.update({
+                        "num_gpus": op.gpu_required, # 请求分数GPU
+                        "placement_group": self.gpu_pg,
+                        "placement_group_bundle_index": bundle_index,
+                        "runtime_env": {
+                            "env_vars": { "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE": str(percentage) }
+                        }
+                    })
+                    
+                    actor = Actor.options(**actor_options).remote(op)
+                    actor.load_model.remote() # 异步加载模型
+                    actors[op._name].append(actor)
+
+                else: # CPU Actor
+                    actor_options.update({
+                        "num_gpus": 0,
+                        "placement_group": self.gpu_pg,
+                        "placement_group_bundle_index": cpu_bundle_index,
+                    })
+                    actor = Actor.options(**actor_options).remote(op)
+                    actors[op._name].append(actor)
 
             logger.info(f"Operator {op._name} has {len(actors[op._name])} actor(s).")
-
-        # Step 2: 设置每个 operator 的 batch size
-        batch_sizes = {
-            op._name: op.batch_size if hasattr(op, 'batch_size') else 1
-            for op in operators
-        }
-
+        # Step 3: 设置每个 operator 的 batch size
+        batch_sizes = {op._name: op.batch_size if hasattr(op, 'batch_size') else 1 for op in operators}
         logger.info(f"Batch sizes per operator: {batch_sizes}")
 
-        # Step 3: 如果只有一个 operator，单独处理
         if len(operators) == 1:
             return self._process_single_operator_streaming(operators[0], actors[operators[0]._name], batch_sizes[operators[0]._name])
 
@@ -240,11 +295,7 @@ class RayDataset(DJDataset):
         termination_counters = {}
         for op in operators:
             actor_queues[op._name] = []
-            termination_counters[op._name] = {
-                'count': 0,
-                'lock': threading.Lock(),
-                'total': len(actors[op._name])
-            }
+            termination_counters[op._name] = {'count': 0, 'lock': threading.Lock(), 'total': len(actors[op._name])}
             for i, actor in enumerate(actors[op._name]):
                 actor_queues[op._name].append(queue.Queue(maxsize=50))
 
@@ -257,8 +308,7 @@ class RayDataset(DJDataset):
             for i, actor in enumerate(actors[op._name]):
                 thread = threading.Thread(
                     target=self._process_actor_streaming,
-                    args=(idx, op, actor, i, actor_queues, actors, operators, final_results, 
-                        result_lock, batch_sizes[op._name], termination_counters),
+                    args=(idx, op, actor, i, actor_queues, actors, operators, final_results, result_lock, batch_sizes[op._name], termination_counters),
                     name=f"actor_{op._name}_{i}",
                     daemon=True
                 )
@@ -303,18 +353,19 @@ class RayDataset(DJDataset):
             thread.join()
 
         if final_results:
-            # print("\nFinal Res:", final_results)
             self.data = from_items(final_results)
+        # 清理Placement Group
+        if self.gpu_pg:
+            ray.util.remove_placement_group(self.gpu_pg)
+            self.gpu_pg = None
 
         return self
     
-    def _process_actor_streaming(self, op_idx, op, actor, actor_id, actor_queues, actors, operators, 
-                           final_results, result_lock, batch_size, termination_counters):
-        """流式处理actor数据，带数据流向跟踪"""
+    def _process_actor_streaming(self, op_idx, op, actor, actor_id, actor_queues, actors, operators, final_results, result_lock, batch_size, termination_counters):
+        """流式处理actor数据，带数据流向跟踪（已修正）"""
         op_name = op._name
         input_queue = actor_queues[op_name][actor_id]
         
-        # 确定输出目标
         next_op_queues = None
         if op_idx + 1 < len(operators):
             next_op_name = operators[op_idx + 1]._name
@@ -324,7 +375,7 @@ class RayDataset(DJDataset):
         processed_count = 0
         batch_buffer = []
         next_actor_index = 0
-        
+
         # 数据流向跟踪函数
         def log_data_flow(row_id, action, start_time=None):
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
@@ -333,18 +384,38 @@ class RayDataset(DJDataset):
             elif action == "end":
                 duration = (time.time() - start_time) 
                 logger.info(f"[DataFlow] Row {row_id} | {op_name}_actor_{actor_id} | END | {timestamp} | Duration: {duration:.3f} s")
-        
+
+        def flush_buffer(current_next_actor_index):
+            """
+            辅助函数，用于处理并清空缓冲区。
+            它会更新外部的 processed_count 并返回成功转发的结果数量。
+            """
+            if not batch_buffer:
+                return 0
+            
+            nonlocal processed_count
+            items_in_buffer = len(batch_buffer)
+            
+            results_count = self._process_and_forward_batch(
+                op, actor, batch_buffer, next_op_queues, final_results, 
+                result_lock, current_next_actor_index, log_data_flow
+            )
+            
+            # 核心修正：无论处理结果如何，处理过的项目数都应该增加
+            processed_count += items_in_buffer
+            batch_buffer.clear() # 清空缓冲区
+            
+            return results_count
+
         while True:
             try:
-                data_item = input_queue.get(timeout=30.0)
+                # 将超时时间设置得短一些，可以更频繁地处理因超时而触发的批次
+                data_item = input_queue.get(timeout=5.0) 
+                
                 if data_item is None:
-                    # 处理剩余的batch数据
-                    if batch_buffer:
-                        results_count = self._process_and_forward_batch(
-                            op, actor, batch_buffer, next_op_queues, final_results, 
-                            result_lock, next_actor_index, log_data_flow
-                        )
-                        next_actor_index += results_count
+                    # 修正 #1: 统一调用 flush_buffer 来处理最后的批次
+                    results_count = flush_buffer(next_actor_index)
+                    # 注意：这里不需要再更新 next_actor_index，因为这是最后的批次
                     
                     # 更新终止计数器
                     with termination_counters[op_name]['lock']:
@@ -352,45 +423,33 @@ class RayDataset(DJDataset):
                         current_count = termination_counters[op_name]['count']
                         total_actors = termination_counters[op_name]['total']
                     
-                    # 只有当所有actor都收到None时才通知下游
                     if current_count >= total_actors and next_op_queues:
                         for q in next_op_queues:
                             q.put(None)
                     
-                    break
+                    break # 退出循环
                 
-                # 获取行号，如果没有则使用"unknown"
                 row_id = data_item.get('_row_id', 'unknown')
                 start_time = time.time()
-                log_data_flow(row_id, "start", start_time)
+                # 注意：我们将 START 日志移到 _process_and_forward_batch 中，以更准确地反映处理开始时间
+                # log_data_flow(row_id, "start", start_time) # 建议移动此行
                 
-                batch_buffer.append((data_item, start_time, row_id))  # 保存数据、开始时间和行号
+                batch_buffer.append((data_item, start_time, row_id))
                 
-                # 当batch满了时处理，或者对于非批处理操作立即处理
                 if len(batch_buffer) >= batch_size or not op.is_batched_op():
-                    results_count = self._process_and_forward_batch(
-                        op, actor, batch_buffer, next_op_queues, final_results, 
-                        result_lock, next_actor_index, log_data_flow
-                    )
+                    results_count = flush_buffer(next_actor_index)
                     next_actor_index += results_count
-                    processed_count += len(batch_buffer)
-                    batch_buffer = []
-                
+
             except queue.Empty:
-                # 超时时处理已有的batch数据
-                if batch_buffer:
-                    results_count = self._process_and_forward_batch(
-                        op, actor, batch_buffer, next_op_queues, final_results, 
-                        result_lock, next_actor_index, log_data_flow
-                    )
-                    next_actor_index += results_count
-                    processed_count += len(batch_buffer)
-                    batch_buffer = []
-                continue
+                # 修正 #2: 统一调用 flush_buffer 并正确处理返回值
+                results_count = flush_buffer(next_actor_index)
+                next_actor_index += results_count
+                continue # 继续等待下一个数据项
             except Exception as e:
                 logger.error(f"Error in {op_name} actor {actor_id}: {e}")
                 break
         
+        # 修正 #3: 最终日志现在会报告正确的计数值
         logger.info(f"Streaming processor for {op_name} actor {actor_id} completed, processed {processed_count} items")
 
     def _process_batch(self, op, actor, batch_data, final_results, result_lock):
@@ -427,18 +486,33 @@ class RayDataset(DJDataset):
             logger.error(f"Error processing batch: {e}")
 
     def _submit_to_actor(self, op, actor, data_item):
-        if isinstance(op, Mapper):
-            if op.use_cuda():
-                return actor.mapper_cuda_batched.remote(self.transform_to_2d_format(data_item)) if op.is_batched_op() else actor.mapper_cuda.remote(data_item)
-                # return actor.mapper_cuda_batched.remote(data_item) if op.is_batched_op() else actor.mapper_cuda.remote(data_item)
-            else:
-                return actor.mapper_cpu.remote(data_item)
+        try:
+            if isinstance(op, Mapper):
+                try:
+                    if op.use_cuda():
+                        return actor.mapper_cuda_batched.remote(self.transform_to_2d_format(data_item)) if op.is_batched_op() else actor.mapper_cuda.remote(data_item)
+                        # return actor.mapper_cuda_batched.remote(data_item) if op.is_batched_op() else actor.mapper_cuda.remote(data_item)
+                    else:
+                        if 'cut' in op._name:
+                            return actor.mapper_cpu_cut.remote(data_item)
+                        else:
+                            return actor.mapper_cpu_detect.remote(data_item)
+                except Exception as e:
+                    raise RuntimeError(f"Error in Mapper operation: {str(e)}") from e
 
-        elif isinstance(op, Filter):
-            if op.use_cuda():
-                return actor.filter_cuda_batched.remote(data_item) if op.is_batched_op() else actor.filter_cuda_single.remote(data_item)
-            else:
-                return actor.filter_cpu_batched.remote(data_item) if op.is_batched_op() else actor.filter_cpu_single.remote(data_item)
+            elif isinstance(op, Filter):
+                try:
+                    if op.use_cuda():
+                        return actor.filter_cuda_batched.remote(data_item) if op.is_batched_op() else actor.filter_cuda_single.remote(data_item)
+                    else:
+                        return actor.filter_cpu_batched.remote(data_item) if op.is_batched_op() else actor.filter_cpu_single.remote(data_item)
+                except Exception as e:
+                    raise RuntimeError(f"Error in Filter operation: {str(e)}") from e
+
+        except Exception as e:
+
+            print(f"Error in _submit_to_actor: {str(e)}")
+            raise  
 
     def _process_and_forward_batch(self, op, actor, batch_data_with_metadata, next_op_queues, 
                               final_results, result_lock, next_actor_index, log_data_flow):
@@ -513,7 +587,7 @@ class RayDataset(DJDataset):
                 log_data_flow(row_id, "end", start_time)
             logger.error(f"Error processing and forwarding batch: {e}")
             return 0
-        
+    
     def _process_single_operator_streaming(self, op, op_actors, batch_size):
         """流式处理单个operator"""
         final_results = []
@@ -573,10 +647,9 @@ class RayDataset(DJDataset):
                 
                 # 当batch满了或者是批处理操作时处理
                 if len(batch_buffer) >= batch_size or not op.is_batched_op():
-                    processed_batch_len = len(batch_buffer)
                     self._process_batch(op, actor, batch_buffer, final_results, result_lock)
                     batch_buffer = []
-                    processed_count += processed_batch_len
+                    processed_count += len(batch_buffer) if batch_buffer else 1
                 
             except queue.Empty:
                 # 超时时处理已有的batch数据
@@ -590,77 +663,83 @@ class RayDataset(DJDataset):
         
         logger.info(f"Single actor completed, processed {processed_count} items")
 
+    def has_splitOP(self, operators):
+        # 默认split是第一个op
+        has_split = (len(operators) > 1 and
+                        isinstance(operators[0], Mapper) and
+                        'split' in operators[0]._name)
+        return has_split
+
+    def add_meta_stats_columns(self, operators):
+        # 添加meta和stats列
+        add_meta = False
+        add_stats = False
+        for op in operators:
+            columns = self.data.columns()
+            if op._name in TAGGING_OPS.modules and Fields.meta not in self.data.columns():
+                add_meta = True
+            if isinstance(op, Filter):
+                if Fields.stats not in columns:
+                    add_stats = True
+
+        if add_meta:
+            def process_batch_arrow(table: pyarrow.Table):
+                new_column_data = [{} for _ in range(len(table))]
+                new_table = table.append_column(Fields.meta, [new_column_data])
+                return new_table
+
+            self.data = self.data.map_batches(process_batch_arrow, batch_format="pyarrow")
+
+        if add_stats:
+            def process_batch_arrow(table: pyarrow.Table):
+                new_column_data = [{} for _ in range(len(table))]
+                new_table = table.append_column(Fields.stats, [new_column_data])
+                return new_table
+
+            self.data = self.data.map_batches(process_batch_arrow, batch_format="pyarrow")
 
     def transform_to_2d_format(self, data):
-        """
-        将第二种格式的数据转换为第一种嵌套格式
-        根据 __dj__source_file__ 的唯一值来分组所有字段
-        """
-        # print("data before trans", data)
         if '__dj__source_file__' not in data:
             if 'videos' not in data:
                 raise ValueError("数据中缺少 '__dj__source_file__' 字段且无法从 'videos' 字段推断")
-            # print(data)
             data['__dj__source_file__'] = data['videos']
-
-        
+        data.pop('_row_id', None)
+        data.pop('time_pairs', None)
         source_files = data['__dj__source_file__']
-        
-        # 获取唯一的源文件并保持顺序
-        unique_sources = list(dict.fromkeys(source_files))
-        
-        # 为每个唯一源文件创建索引映射
-        source_to_indices = {}
-        for source in unique_sources:
-            source_to_indices[source] = [i for i, s in enumerate(source_files) if s == source]
-        
-        # 初始化转换后的数据结构
-        transformed_data = {}
-        
-        # 遍历原数据的所有字段
+        source_len = len(source_files)
+
+        # 校验并自动填充
         for field_name, field_value in data.items():
             if field_name == '__dj__source_file__':
-                # 特殊处理 __dj__source_file__ 字段
-                transformed_data[field_name] = []
-                for source in unique_sources:
-                    indices = source_to_indices[source]
-                    transformed_data[field_name].append([source] * len(indices))
-            elif isinstance(field_value, list):
-                # 处理列表类型的字段
-                transformed_data[field_name] = []
-                for source in unique_sources:
-                    indices = source_to_indices[source]
-                    group_data = [field_value[i] for i in indices]
-                    transformed_data[field_name].append(group_data)
+                continue
+            if isinstance(field_value, list):
+                if len(field_value) != source_len:
+                    data[field_name] = field_value + [None] * (source_len - len(field_value))
             elif isinstance(field_value, dict):
-                # 处理字典类型的字段
-                transformed_data[field_name] = []
-                for source in unique_sources:
-                    indices = source_to_indices[source]
-                    group_dict = {}
-                    for key, values in field_value.items():
-                        if isinstance(values, list):
-                            group_dict[key] = [values[i] for i in indices]
-                        else:
-                            # 如果值不是列表，则重复该值
-                            group_dict[key] = [values] * len(indices)
-                    transformed_data[field_name].append(group_dict)
-            elif isinstance(field_value, str):
-                # 处理字符串类型的字段
-                transformed_data[field_name] = []
-                for source in unique_sources:
-                    indices = source_to_indices[source]
-                    # 对于字符串，为每个组重复该字符串
-                    transformed_data[field_name].append(field_value)
+                for key, value in field_value.items():
+                    if isinstance(value, list) and len(value) != source_len:
+                        field_value[key] = value + [None] * (source_len - len(value))
+
+        # 后续分组逻辑保持不变...
+        unique_sources = list(dict.fromkeys(source_files))
+        source_to_indices = {source: [i for i, s in enumerate(source_files) if s == source] for source in unique_sources}
+        transformed_data = {}
+
+        for field_name, field_value in data.items():
+            if field_name == '__dj__source_file__':
+                transformed_data[field_name] = [[source] * len(indices) for source, indices in source_to_indices.items()]
+            elif isinstance(field_value, list):
+                transformed_data[field_name] = [[field_value[i] for i in indices] for source, indices in source_to_indices.items()]
+            elif isinstance(field_value, dict):
+                transformed_data[field_name] = [{
+                    key: [values[i] for i in indices] if isinstance(values, list) else [values] * len(indices)
+                    for key, values in field_value.items()
+                } for source, indices in source_to_indices.items()]
             else:
-                # 处理其他类型的字段
-                transformed_data[field_name] = []
-                for source in unique_sources:
-                    indices = source_to_indices[source]
-                    # 为每个组重复该值
-                    transformed_data[field_name].append(field_value)
-        # print("data after trans", transformed_data)
+                transformed_data[field_name] = [field_value] * len(unique_sources)
+
         return transformed_data
+
 
     
     def _run_single_op(self, op):
@@ -767,6 +846,7 @@ class RayDataset(DJDataset):
         }:
             return getattr(ray.data, f"read_{data_format}")(paths)
 
+
     @classmethod
     def read_json(cls, paths: Union[str, List[str]]) -> RayDataset:
         # Note: a temp solution for reading json stream
@@ -787,7 +867,7 @@ class RayDataset(DJDataset):
         return self.data.to_pandas().to_dict(orient="records")
 
 
-class JSONStreamDatasource(ray.data.read_api.JSONDatasource):
+class JSONStreamDatasource(ray.data.read_api.CSVDatasource):
     """
     A temp Datasource for reading json stream.
 

@@ -1,3 +1,4 @@
+from PIL import Image
 import numpy as np
 from loguru import logger
 from pydantic import PositiveInt
@@ -15,7 +16,9 @@ from data_juicer.utils.mm_utils import (
 from ...utils.model_utils import get_model, prepare_model
 from ..base_op import OPERATORS, Filter
 from ..op_fusion import INTER_SAMPLED_FRAMES, LOADED_VIDEOS
-
+import cv2
+from datetime import datetime
+import re
 torch = LazyLoader("torch")
 
 OP_NAME = "video_aesthetics_filter"
@@ -115,7 +118,7 @@ class VideoAestheticsFilter(Filter):
             "" if frame_sampling_method == "all_keyframes" else f"-{frame_num}"
         )
 
-    def compute_stats_single_actor(self, sample, model, processor, rank=None, context=False):
+    def compute_stats_single_actor1(self, sample, model, processor, rank=None, context=False):
         # check if it's computed already
         if StatsKeys.video_frames_aesthetics_score in sample[Fields.stats]:
             return sample
@@ -129,6 +132,7 @@ class VideoAestheticsFilter(Filter):
         sample, videos = load_data_with_context(sample, context, loaded_video_keys, load_video)
 
         aesthetics_scores = []
+        torch.cuda.nvtx.range_push("Aesthetics")
         for key, video in videos.items():
             sampled_frames_key = key + self.sampled_frames_key_suffix
             if video is None:
@@ -149,7 +153,7 @@ class VideoAestheticsFilter(Filter):
                 if context:
                     sample[Fields.context][sampled_frames_key] = frames
             frame_images = [frame.to_image() for frame in frames]
-
+            
             if len(frame_images) > 0:
                 # compute aesthetics_scores
                 # model, processor = get_model(self.model_key, rank=rank, use_cuda=self.use_cuda())
@@ -171,6 +175,7 @@ class VideoAestheticsFilter(Filter):
                 aesthetics_score = 0.0
 
             aesthetics_scores.append(aesthetics_score)
+        torch.cuda.nvtx.range_pop()
 
         logger.debug(f"aesthetics_score: {aesthetics_scores}")
 
@@ -181,7 +186,123 @@ class VideoAestheticsFilter(Filter):
                 close_video(videos[vid_key])
 
         return sample
+    def parse_time_string(self, time_str):
+        """
+        支持两种输入格式:
+        1. "00:00:06.000 [frame=144, fps=24.000]"
+        2. "00:00:06.000"
+        返回 (seconds, frame, fps)
+        """
+        if not isinstance(time_str, str):
+            time_str = str(time_str)
+
+        # 1. 解析主时间戳
+        time_part = time_str.split()[0]  # e.g. "00:00:06.000"
+        dt = datetime.strptime(time_part, "%H:%M:%S.%f")
+        seconds = dt.hour * 3600 + dt.minute * 60 + dt.second + dt.microsecond / 1e6
+
+        # 2. 可选解析帧和fps
+        frame, fps = None, None
+        match = re.search(r"\[frame=(\d+), fps=([\d\.]+)\]", time_str)
+        if match:
+            frame = int(match.group(1))
+            fps = float(match.group(2))
+        
+        return seconds, frame, fps
+    def compute_stats_single_actor(self, sample, model, processor, rank=None, context=False):
+        # 如果已计算过，直接返回
+        if StatsKeys.video_frames_aesthetics_score in sample[Fields.stats]:
+            return sample
+
+        # 如果没有视频片段，写空结果
+        if 'time_pairs' not in sample or not sample['time_pairs']:
+            sample[Fields.stats][StatsKeys.video_frames_aesthetics_score] = np.array([], dtype=np.float64)
+            return sample
+
+        aesthetics_scores = []
+        torch.cuda.nvtx.range_push("Aesthetics")
+
+        try:
+            for segment in sample['time_pairs']:
+                video_path = segment['video_path']
+                start_str = segment['start_time']
+                end_str = segment['end_time']
+
+                # 解析时间戳
+                start_seconds, start_frame, fps1 = self.parse_time_string(start_str)
+                end_seconds, end_frame, fps2 = self.parse_time_string(end_str)
+
+                # 打开视频
+                video = cv2.VideoCapture(video_path)
+                if not video.isOpened():
+                    logger.warning(f"Failed to open video: {video_path}")
+                    aesthetics_scores.append(0.0)
+                    continue
+
+                try:
+                    fps = video.get(cv2.CAP_PROP_FPS) or fps1 or fps2
+
+                    # 优先用帧数，其次用秒数*fps
+                    if start_frame is None:
+                        start_frame = int(start_seconds * fps)
+                    if end_frame is None:
+                        end_frame = int(end_seconds * fps)
+
+                    frames = []
+                    if self.frame_sampling_method == "all_keyframes":
+                        step = max(1, (end_frame - start_frame) // self.frame_num)
+                        for frame_idx in range(start_frame, end_frame, step):
+                            video.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                            ret, frame = video.read()
+                            if ret:
+                                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                frames.append(Image.fromarray(frame))
+                    else:  # uniform sampling
+                        for i in range(self.frame_num):
+                            frame_idx = start_frame + int(i * (end_frame - start_frame) / (self.frame_num - 1)) if self.frame_num > 1 else start_frame
+                            video.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                            ret, frame = video.read()
+                            if ret:
+                                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                                frames.append(Image.fromarray(frame))
+
+                    # 保存 context
+                    if context:
+                        segment_key = f"{video_path}_{start_seconds}_{end_seconds}"
+                        sample[Fields.context][segment_key] = frames
+
+                    # 模型推理
+                    if len(frames) > 0:
+                        inputs = processor(images=frames, return_tensors="pt").to(model.device)
+                        with torch.no_grad():
+                            outputs = model(**inputs)
+
+                        if self.need_normalized_by_ten:
+                            aesthetics_score = outputs.logits / 10.0
+                        else:
+                            aesthetics_score = outputs.logits
+
+                        if self.reduce_mode == "avg":
+                            aesthetics_score = float(aesthetics_score.mean())
+                        elif self.reduce_mode == "max":
+                            aesthetics_score = float(aesthetics_score.max())
+                        else:
+                            aesthetics_score = float(aesthetics_score.min())
+                    else:
+                        aesthetics_score = 0.0
+
+                    aesthetics_scores.append(aesthetics_score)
+                finally:
+                    video.release()
+
+        finally:
+            torch.cuda.nvtx.range_pop()
+
+        logger.debug(f"aesthetics_score: {aesthetics_scores}")
+        sample[Fields.stats][StatsKeys.video_frames_aesthetics_score] = aesthetics_scores
+        return sample
     def compute_stats_single(self, sample, rank=None, context=False):
+        print(f"sample in compute_stats_single: {sample}")
         # check if it's computed already
         if StatsKeys.video_frames_aesthetics_score in sample[Fields.stats]:
             return sample

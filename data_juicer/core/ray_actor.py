@@ -40,18 +40,22 @@ class Actor:
         data = self.op.process_batched_actor(data, self.model, self.processor)
         return data
 
-    def mapper_cpu(self, data):
+    def mapper_cpu_detect(self, data):
         # 处理数据
-        processed_data = self.op.process_single(data)
+        processed_data = self.op.detect(data)
         return processed_data
-    
+    def mapper_cpu_cut(self, data):
+        # 处理数据
+        processed_data = self.op.cut(data)
+        return processed_data
     def filter_cuda_single(self, data):
         if not self._model_loaded:
             self.load_model()
         data = self.op.compute_stats_single_actor(data, self.model, self.processor)
         keep = self.op.process_single(data)
-
+        print(f"keep: {keep}")
         if keep:
+            print(f"data: {data}")
             return data
         else:
             return None
@@ -59,8 +63,8 @@ class Actor:
     def filter_cuda_batched(self, data):
         if not self._model_loaded:
             self.load_model()
-        data = self.op.compute_stats_batched(data, self.model, self.processor)
-        
+        # data = self.op.compute_stats_batched(data, self.model, self.processor)
+        data = self.op.compute_stats_batched(data)
         keep_mask = list(self.op.process_batched(data))  # 将map对象转换为列表
     
         # 如果没有数据需要保留，返回None
