@@ -318,6 +318,10 @@ class VideoCaptioningFromFramesMapper(Mapper):
         return generated_text_per_chunk
 
     def process_batched_actor(self, samples, model, processor, rank=None, context=False):
+        """
+        Process a batch of samples in the actor.
+        With the model and processor loaded when the actor was created.
+        """
         # reconstruct samples from "dict of lists" to "list of dicts"
         reconstructed_samples = []
         for i in range(len(samples[self.text_key])):
