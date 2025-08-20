@@ -1,10 +1,7 @@
 import math
 import re
 from itertools import chain
-import time  # 导入time模块
-
 from pydantic import NonNegativeFloat, NonNegativeInt
-
 from data_juicer.utils.constant import Fields
 from data_juicer.utils.file_utils import add_suffix_to_filename, transfer_filename
 from data_juicer.utils.lazy_loader import LazyLoader
@@ -16,14 +13,12 @@ scenedetect = LazyLoader("scenedetect")
 
 OP_NAME = "video_split_by_scene_mapper"
 
-
 def replace_func(match, scene_counts_iter):
     try:
         count = next(scene_counts_iter)
         return SpecialTokens.video * count
     except StopIteration:
         return match.group(0)
-
 
 @OPERATORS.register_module(OP_NAME)
 class VideoSplitBySceneMapper(Mapper):

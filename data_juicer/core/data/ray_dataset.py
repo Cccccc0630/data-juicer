@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime
 import os
 from functools import partial
@@ -9,7 +8,6 @@ import threading
 import time
 from typing import Any, Dict, List, Literal, Optional, Union
 import uuid
-import numpy
 from data_juicer.core.ray_actor import Actor
 import pyarrow
 from jsonargparse import Namespace
@@ -25,15 +23,8 @@ from data_juicer.utils.file_utils import is_remote_path
 from data_juicer.utils.lazy_loader import LazyLoader
 from data_juicer.utils.process_utils import calculate_np
 from data_juicer.utils.webdataset_utils import _custom_default_decoder
-import ray
+
 ray = LazyLoader("ray")
-from ray.util.placement_group import (
-    placement_group,
-    placement_group_table,
-    remove_placement_group,
-)
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from ray.data import from_items
 
 def get_abs_path(path, dataset_dir):
     if is_remote_path(path):
@@ -204,7 +195,11 @@ class RayDataset(DJDataset):
         # Step 1: 创建所有 operator 的 actor
         actors = {}
         for op in operators:
-            op_proc = 1 if op.use_cuda() else calculate_np(op._name, op.mem_required, op.cpu_required, self.num_proc, op.use_cuda())
+            op_proc = (
+                1
+                if op.use_cuda()
+                else calculate_np(op._name, op.mem_required, op.cpu_required, self.num_proc, op.use_cuda())
+            )
             # actor_num = min(op_proc, self.data.count())
             actor_num = op_proc
             actors[op._name] = []
@@ -213,7 +208,7 @@ class RayDataset(DJDataset):
                 actor = Actor.options(
                     name=f"actor_{op._name}_{uuid.uuid4().hex[:4]}",
                     num_gpus=op.gpu_required if op.use_cuda() else 0,
-                    num_cpus=op.cpu_required
+                    num_cpus=op.cpu_required,
                 ).remote(op)
 
                 if op.use_cuda():
@@ -224,27 +219,22 @@ class RayDataset(DJDataset):
             logger.info(f"Operator {op._name} has {len(actors[op._name])} actor(s).")
 
         # Step 2: 设置每个 operator 的 batch size
-        batch_sizes = {
-            op._name: op.batch_size if hasattr(op, 'batch_size') else 1
-            for op in operators
-        }
+        batch_sizes = {op._name: op.batch_size if hasattr(op, "batch_size") else 1 for op in operators}
 
         logger.info(f"Batch sizes per operator: {batch_sizes}")
 
         # Step 3: 如果只有一个 operator，单独处理
         if len(operators) == 1:
-            return self._process_single_operator_streaming(operators[0], actors[operators[0]._name], batch_sizes[operators[0]._name])
+            return self._process_single_operator_streaming(
+                operators[0], actors[operators[0]._name], batch_sizes[operators[0]._name]
+            )
 
         # Step 4: 为每个actor创建独立的数据队列和终止计数器
         actor_queues = {}
         termination_counters = {}
         for op in operators:
             actor_queues[op._name] = []
-            termination_counters[op._name] = {
-                'count': 0,
-                'lock': threading.Lock(),
-                'total': len(actors[op._name])
-            }
+            termination_counters[op._name] = {"count": 0, "lock": threading.Lock(), "total": len(actors[op._name])}
             for i, actor in enumerate(actors[op._name]):
                 actor_queues[op._name].append(queue.Queue(maxsize=50))
 
@@ -257,10 +247,20 @@ class RayDataset(DJDataset):
             for i, actor in enumerate(actors[op._name]):
                 thread = threading.Thread(
                     target=self._process_actor_streaming,
-                    args=(idx, op, actor, i, actor_queues, actors, operators, final_results, 
-                        result_lock, batch_sizes[op._name], termination_counters),
+                    args=(
+                        idx, 
+                        op, 
+                        actor, 
+                        i, 
+                        actor_queues, 
+                        operators, 
+                        final_results, 
+                        result_lock, 
+                        batch_sizes[op._name], 
+                        termination_counters,
+                    ),
                     name=f"actor_{op._name}_{i}",
-                    daemon=True
+                    daemon=True,
                 )
                 thread.start()
                 threads.append(thread)
@@ -276,7 +276,7 @@ class RayDataset(DJDataset):
                 for batch in self.data.iter_batches(batch_size=1, batch_format="pyarrow"):
                     for row_idx in range(len(batch)):
                         row_data = {col: batch[col][row_idx].as_py() for col in batch.column_names}
-                        row_data['_row_id'] = row_counter  # 添加行号到数据中
+                        row_data["_row_id"] = row_counter  # 添加行号到数据中
                         row_counter += 1
                         
                         # 轮询分发给不同的actor队列
@@ -304,12 +304,23 @@ class RayDataset(DJDataset):
 
         if final_results:
             # print("\nFinal Res:", final_results)
-            self.data = from_items(final_results)
+            self.data = ray.data.from_items(final_results)
 
         return self
     
-    def _process_actor_streaming(self, op_idx, op, actor, actor_id, actor_queues, actors, operators, 
-                           final_results, result_lock, batch_size, termination_counters):
+    def _process_actor_streaming(
+            self, 
+            op_idx,
+            op, 
+            actor, 
+            actor_id, 
+            actor_queues, 
+            operators, 
+            final_results, 
+            result_lock, 
+            batch_size, 
+            termination_counters,
+        ):
         """流式处理actor数据，带数据流向跟踪"""
         op_name = op._name
         input_queue = actor_queues[op_name][actor_id]
@@ -331,9 +342,11 @@ class RayDataset(DJDataset):
             if action == "start":
                 logger.info(f"[DataFlow] Row {row_id} | {op_name}_actor_{actor_id} | START | {timestamp}")
             elif action == "end":
-                duration = (time.time() - start_time) 
-                logger.info(f"[DataFlow] Row {row_id} | {op_name}_actor_{actor_id} | END | {timestamp} | Duration: {duration:.3f} s")
-        
+                duration = time.time() - start_time
+                logger.info(
+                    f"[DataFlow] Row {row_id} | {op_name}_actor_{actor_id} | END | {timestamp} | Duration: {duration:.3f} s"
+                )
+
         while True:
             try:
                 data_item = input_queue.get(timeout=30.0)
@@ -341,17 +354,23 @@ class RayDataset(DJDataset):
                     # 处理剩余的batch数据
                     if batch_buffer:
                         results_count = self._process_and_forward_batch(
-                            op, actor, batch_buffer, next_op_queues, final_results, 
-                            result_lock, next_actor_index, log_data_flow
+                            op, 
+                            actor, 
+                            batch_buffer, 
+                            next_op_queues, 
+                            final_results, 
+                            result_lock, 
+                            next_actor_index, 
+                            log_data_flow,
                         )
                         next_actor_index += results_count
                     
                     # 更新终止计数器
-                    with termination_counters[op_name]['lock']:
-                        termination_counters[op_name]['count'] += 1
-                        current_count = termination_counters[op_name]['count']
-                        total_actors = termination_counters[op_name]['total']
-                    
+                    with termination_counters[op_name]["lock"]:
+                        termination_counters[op_name]["count"] += 1
+                        current_count = termination_counters[op_name]["count"]
+                        total_actors = termination_counters[op_name]["total"]
+
                     # 只有当所有actor都收到None时才通知下游
                     if current_count >= total_actors and next_op_queues:
                         for q in next_op_queues:
@@ -360,7 +379,7 @@ class RayDataset(DJDataset):
                     break
                 
                 # 获取行号，如果没有则使用"unknown"
-                row_id = data_item.get('_row_id', 'unknown')
+                row_id = data_item.get("_row_id", "unknown")
                 start_time = time.time()
                 log_data_flow(row_id, "start", start_time)
                 
@@ -369,8 +388,14 @@ class RayDataset(DJDataset):
                 # 当batch满了时处理，或者对于非批处理操作立即处理
                 if len(batch_buffer) >= batch_size or not op.is_batched_op():
                     results_count = self._process_and_forward_batch(
-                        op, actor, batch_buffer, next_op_queues, final_results, 
-                        result_lock, next_actor_index, log_data_flow
+                        op, 
+                        actor, 
+                        batch_buffer, 
+                        next_op_queues, 
+                        final_results, 
+                        result_lock, 
+                        next_actor_index, 
+                        log_data_flow,
                     )
                     next_actor_index += results_count
                     processed_count += len(batch_buffer)
@@ -380,8 +405,14 @@ class RayDataset(DJDataset):
                 # 超时时处理已有的batch数据
                 if batch_buffer:
                     results_count = self._process_and_forward_batch(
-                        op, actor, batch_buffer, next_op_queues, final_results, 
-                        result_lock, next_actor_index, log_data_flow
+                        op, 
+                        actor, 
+                        batch_buffer, 
+                        next_op_queues, 
+                        final_results, 
+                        result_lock, 
+                        next_actor_index, 
+                        log_data_flow,
                     )
                     next_actor_index += results_count
                     processed_count += len(batch_buffer)
@@ -429,19 +460,39 @@ class RayDataset(DJDataset):
     def _submit_to_actor(self, op, actor, data_item):
         if isinstance(op, Mapper):
             if op.use_cuda():
-                return actor.mapper_cuda_batched.remote(self.transform_to_2d_format(data_item)) if op.is_batched_op() else actor.mapper_cuda.remote(data_item)
-                # return actor.mapper_cuda_batched.remote(data_item) if op.is_batched_op() else actor.mapper_cuda.remote(data_item)
+                return (
+                    actor.mapper_cuda_batched.remote(self.transform_to_2d_format(data_item))
+                    if op.is_batched_op()
+                    else actor.mapper_cuda.remote(data_item)
+                )
             else:
                 return actor.mapper_cpu.remote(data_item)
 
         elif isinstance(op, Filter):
             if op.use_cuda():
-                return actor.filter_cuda_batched.remote(data_item) if op.is_batched_op() else actor.filter_cuda_single.remote(data_item)
+                return (
+                    actor.filter_cuda_batched.remote(data_item)
+                    if op.is_batched_op()
+                    else actor.filter_cuda_single.remote(data_item)
+                )
             else:
-                return actor.filter_cpu_batched.remote(data_item) if op.is_batched_op() else actor.filter_cpu_single.remote(data_item)
+                return (
+                    actor.filter_cpu_batched.remote(data_item)
+                    if op.is_batched_op()
+                    else actor.filter_cpu_single.remote(data_item)
+                )
 
-    def _process_and_forward_batch(self, op, actor, batch_data_with_metadata, next_op_queues, 
-                              final_results, result_lock, next_actor_index, log_data_flow):
+    def _process_and_forward_batch(
+            self, 
+            op, 
+            actor, 
+            batch_data_with_metadata, 
+            next_op_queues, 
+            final_results, 
+            result_lock, 
+            next_actor_index, 
+            log_data_flow,
+        ):
         """处理batch数据并转发到下游，带数据流向跟踪"""
         if not batch_data_with_metadata:
             return 0
@@ -494,7 +545,7 @@ class RayDataset(DJDataset):
                     try:
                         # 保持行号传递到下游
                         if isinstance(result, dict):
-                            result['_row_id'] = row_ids[i % len(row_ids)]
+                            result["_row_id"] = row_ids[i % len(row_ids)]
                         
                         target_queue_idx = (next_actor_index + i) % len(next_op_queues)
                         next_op_queues[target_queue_idx].put(result)
@@ -528,7 +579,7 @@ class RayDataset(DJDataset):
             thread = threading.Thread(
                 target=self._process_single_actor,
                 args=(op, actor, actor_queues[i], final_results, result_lock, batch_size),
-                daemon=True
+                daemon=True,
             )
             thread.start()
             threads.append(thread)
@@ -551,7 +602,7 @@ class RayDataset(DJDataset):
             thread.join()
         
         if final_results:
-            self.data = from_items(final_results)
+            self.data = ray.data.from_items(final_results)
         
         return self
     
@@ -597,15 +648,14 @@ class RayDataset(DJDataset):
         根据 __dj__source_file__ 的唯一值来分组所有字段
         """
         # print("data before trans", data)
-        if '__dj__source_file__' not in data:
-            if 'videos' not in data:
+        if "__dj__source_file__" not in data:
+            if "videos" not in data:
                 raise ValueError("数据中缺少 '__dj__source_file__' 字段且无法从 'videos' 字段推断")
             # print(data)
-            data['__dj__source_file__'] = data['videos']
+            data["__dj__source_file__"] = data["videos"]
 
-        
-        source_files = data['__dj__source_file__']
-        
+        source_files = data["__dj__source_file__"]
+
         # 获取唯一的源文件并保持顺序
         unique_sources = list(dict.fromkeys(source_files))
         
@@ -619,7 +669,7 @@ class RayDataset(DJDataset):
         
         # 遍历原数据的所有字段
         for field_name, field_value in data.items():
-            if field_name == '__dj__source_file__':
+            if field_name == "__dj__source_file__":
                 # 特殊处理 __dj__source_file__ 字段
                 transformed_data[field_name] = []
                 for source in unique_sources:

@@ -23,7 +23,7 @@ ATTRIBUTION_FILTERS = Registry("Attribution Filters")
 
 import pytz
 from datetime import datetime
-beijing_tz = pytz.timezone('Asia/Singapore')
+beijing_tz = pytz.timezone("Asia/Singapore")
 
 def convert_list_dict_to_dict_list(samples):
     # reconstruct samples from "list of dicts" to "dict of lists"
@@ -300,10 +300,10 @@ class OP:
         end = time.time()
         end_time = datetime.fromtimestamp(end, pytz.utc).astimezone(beijing_tz)
         print(
-                f"[Actor] {self._name} Model loaded in {end - start:.3f} seconds "
-                f"from {start_time.strftime('%Y-%m-%d %H:%M:%S')} "
-                f"to {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
-            )
+            f"[Actor] {self._name} Model loaded in {end - start:.3f} seconds "
+            f"from {start_time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"to {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
         return model, processor
     
 class Mapper(OP):

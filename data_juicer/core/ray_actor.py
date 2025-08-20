@@ -1,15 +1,5 @@
-from functools import partial
-import ray
 import pyarrow
-
-from data_juicer.ops.base_op import Filter, Mapper
-from loguru import logger
-
-
-
-def filter_batch(batch, filter_func):
-    mask = pyarrow.array(filter_func(batch.to_pydict()))
-    return batch.filter(mask)
+import ray
 
 @ray.remote(num_gpus=0.0) 
 class Actor:
@@ -71,8 +61,7 @@ class Actor:
         if isinstance(data, dict):
             # 如果data是字典（假设每个key对应一个列表）
             filtered_data = {
-                key: [value for value, keep in zip(values, keep_mask) if keep]
-                for key, values in data.items()
+                key: [value for value, keep in zip(values, keep_mask) if keep] for key, values in data.items()
             }
         elif isinstance(data, list):
             # 如果data是列表
@@ -105,8 +94,7 @@ class Actor:
         if isinstance(data, dict):
             # 如果data是字典（假设每个key对应一个列表）
             filtered_data = {
-                key: [value for value, keep in zip(values, keep_mask) if keep]
-                for key, values in data.items()
+                key: [value for value, keep in zip(values, keep_mask) if keep] for key, values in data.items()
             }
         elif isinstance(data, list):
             # 如果data是列表
