@@ -89,14 +89,20 @@ class VideoResolutionFilter(Filter):
     def process_single(self, sample):
         ws = sample[Fields.stats][StatsKeys.video_width]
         hs = sample[Fields.stats][StatsKeys.video_height]
+        # print(f"[DEBUG] ws: {ws}")
+        # print(f"[DEBUG] hs: {hs}")
+        # print(f"[DEBUG] min_width: {self.min_width}, max_width: {self.max_width}")
+        # print(f"[DEBUG] min_height: {self.min_height}, max_height: {self.max_height}")
         keep_bools = np.array(
             [self.min_width <= w <= self.max_width and self.min_height <= h <= self.max_height for w, h in zip(ws, hs)]
         )
+        # print(f"[DEBUG] keep_bools: {keep_bools}")
         if len(keep_bools) <= 0:
             return True
 
         # different strategies
         if self.any:
+            # print(f"[DEBUG] Strategy: any, result: {keep_bools.any()}")
             return keep_bools.any()
         else:
             return keep_bools.all()

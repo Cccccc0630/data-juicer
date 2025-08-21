@@ -142,6 +142,7 @@ class VideoSplitBySceneMapper(Mapper):
             sample[Fields.source_file].extend([value] * len(output_video_keys[value]))
 
         sample[self.video_key] = list(chain.from_iterable([output_video_keys[key] for key in loaded_video_keys]))
+        # print("Video processing result:", sample)
         return sample
     def process_single2(self, sample, context=False):
         # 打开log.txt文件进行写入日志
