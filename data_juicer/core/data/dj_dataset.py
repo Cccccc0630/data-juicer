@@ -12,7 +12,6 @@ from typing import Any, Dict, List, Optional, Union
 
 from datasets import Dataset, DatasetDict, is_caching_enabled
 from datasets.formatting.formatting import LazyBatch
-from loguru import logger
 
 from data_juicer.core.data.schema import Schema
 from data_juicer.core.monitor import Monitor
@@ -35,6 +34,10 @@ class DJDataset(ABC):
     @abstractmethod
     def process(self, operators, *, exporter=None, checkpointer=None, tracer=None) -> DJDataset:  # TODO: add type hint
         """process a list of operators on the dataset."""
+
+    @abstractmethod
+    def process_parallel(self, operators, *, exporter=None, checkpointer=None, tracer=None) -> DJDataset:
+        """Implementing op parallel data processing based on Ray Actor"""
 
     @abstractmethod
     def schema(self) -> Schema:
@@ -259,6 +262,9 @@ class NestedDataset(Dataset, DJDataset):
         adapter=None,
         open_monitor=True,
     ):
+        # Local import to avoid logger being serialized in multiprocessing
+        from loguru import logger
+
         if operators is None:
             return self
 
@@ -514,6 +520,9 @@ def nested_query(root_obj: Union[NestedDatasetDict, NestedDataset, NestedQueryDi
                 # dive into next level
                 tmp = nested_obj_factory(tmp[".".join(subkeys[i : i + 1])])
             else:
+                # Local import to avoid logger being serialized in multiprocessing
+                from loguru import logger
+
                 logger.debug(
                     f"cannot find item given key={key} in dataset="
                     f"{root_obj}. For the final caught outer-exception,"
