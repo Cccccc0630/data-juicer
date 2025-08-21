@@ -11,6 +11,7 @@ import time
 from typing import Any, Dict, List, Literal, Optional, Union
 import uuid
 # from data_juicer.core.PipelineStrategist import PipelineStrategist
+from data_juicer.core.PipelineOrchestrator import PipelineOrchestrator
 import numpy
 from data_juicer.core.ray_actor import Actor
 import pyarrow
@@ -108,6 +109,7 @@ class RayDataset(DJDataset):
         self.data = preprocess_dataset(dataset, dataset_path, cfg)
         self.num_proc = getattr(cfg, "np", getattr(cfg, "num_proc", None)) if cfg else None
         self.gpu_pg = None
+        self.orchestrator = None
 
     def schema(self) -> Schema:
         """Get dataset schema.
@@ -168,11 +170,13 @@ class RayDataset(DJDataset):
             self.data = self.data.materialize()
         return self
 
-    def process_parallel(self, operators, *, exporter=None, checkpointer=None, tracer=None) -> DJDataset:
+    def process_parallel(self, operators, *, exporter=None, checkpointer=None, tracer=None, reorder_batch_size=1000) -> DJDataset:
         if operators is None:
             return self
         if not isinstance(operators, list):
             operators = [operators]
+        
+        
         # 添加meta和stats列（如果需要）
         self.add_meta_stats_columns(operators)
         last_filter_idx = -1
@@ -186,7 +190,9 @@ class RayDataset(DJDataset):
             cut_op = copy.deepcopy(operators[0])
             cut_op._name = f"{operators[0]._name}_cut"
             operators.insert(last_filter_idx + 1, cut_op) 
-            logger.info(f"Pipeline modified. New order: {[op._name for op in operators]}")           
+            logger.info(f"Pipeline modified. New order: {[op._name for op in operators]}")      
+        self.orchestrator = PipelineOrchestrator(operators, reorder_batch_size)
+        print(f"Orchestrator initialized {self.orchestrator.routing_table}.")     
         # Step 1: 动态构建 Placement Group
         # 计算需要多少个 CPU-only Actor 和多少个 GPU Actor
         gpu_actor_configs = []
@@ -243,6 +249,7 @@ class RayDataset(DJDataset):
         for op in operators:
             op_proc = 1 if op.use_cuda() else calculate_np(op._name, op.mem_required, op.cpu_required, self.num_proc, op.use_cuda())
             actor_num = min(op_proc, self.data.count())
+            # actor_num = op_proc
             actors[op._name] = []
             
             for idx in range(actor_num):
@@ -308,9 +315,10 @@ class RayDataset(DJDataset):
             for i, actor in enumerate(actors[op._name]):
                 thread = threading.Thread(
                     target=self._process_actor_streaming,
-                    args=(idx, op, actor, i, actor_queues, actors, operators, final_results, result_lock, batch_sizes[op._name], termination_counters),
+                    args=(op, actor, i, actor_queues,
+                      final_results, result_lock, batch_sizes[op._name], termination_counters, self.orchestrator),
                     name=f"actor_{op._name}_{i}",
-                    daemon=True
+                    daemon=True,
                 )
                 thread.start()
                 threads.append(thread)
@@ -361,22 +369,18 @@ class RayDataset(DJDataset):
 
         return self
     
-    def _process_actor_streaming(self, op_idx, op, actor, actor_id, actor_queues, actors, operators, final_results, result_lock, batch_size, termination_counters):
-        """流式处理actor数据，带数据流向跟踪（已修正）"""
+    def _process_actor_streaming(self, op, actor, actor_id, actor_queues, final_results, result_lock, batch_size, termination_counters, orchestrator):
+        """
+        流式处理actor数据
+        """
         op_name = op._name
         input_queue = actor_queues[op_name][actor_id]
-        
-        next_op_queues = None
-        if op_idx + 1 < len(operators):
-            next_op_name = operators[op_idx + 1]._name
-            next_op_queues = actor_queues[next_op_name]
         
         logger.info(f"Starting streaming processor for {op_name} actor {actor_id}")
         processed_count = 0
         batch_buffer = []
         next_actor_index = 0
 
-        # 数据流向跟踪函数
         def log_data_flow(row_id, action, start_time=None):
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
             if action == "start":
@@ -386,53 +390,47 @@ class RayDataset(DJDataset):
                 logger.info(f"[DataFlow] Row {row_id} | {op_name}_actor_{actor_id} | END | {timestamp} | Duration: {duration:.3f} s")
 
         def flush_buffer(current_next_actor_index):
-            """
-            辅助函数，用于处理并清空缓冲区。
-            它会更新外部的 processed_count 并返回成功转发的结果数量。
-            """
             if not batch_buffer:
                 return 0
             
             nonlocal processed_count
             items_in_buffer = len(batch_buffer)
             
+            # The call to _process_and_forward_batch remains correct.
             results_count = self._process_and_forward_batch(
-                op, actor, batch_buffer, next_op_queues, final_results, 
-                result_lock, current_next_actor_index, log_data_flow
+                op, actor, batch_buffer, actor_queues, final_results, 
+                result_lock, current_next_actor_index, orchestrator, log_data_flow
             )
             
-            # 核心修正：无论处理结果如何，处理过的项目数都应该增加
             processed_count += items_in_buffer
-            batch_buffer.clear() # 清空缓冲区
+            batch_buffer.clear()
             
             return results_count
 
+        # The rest of the while loop logic remains exactly the same...
         while True:
             try:
-                # 将超时时间设置得短一些，可以更频繁地处理因超时而触发的批次
                 data_item = input_queue.get(timeout=5.0) 
                 
                 if data_item is None:
-                    # 修正 #1: 统一调用 flush_buffer 来处理最后的批次
-                    results_count = flush_buffer(next_actor_index)
-                    # 注意：这里不需要再更新 next_actor_index，因为这是最后的批次
+                    flush_buffer(next_actor_index)
                     
-                    # 更新终止计数器
                     with termination_counters[op_name]['lock']:
                         termination_counters[op_name]['count'] += 1
                         current_count = termination_counters[op_name]['count']
                         total_actors = termination_counters[op_name]['total']
                     
-                    if current_count >= total_actors and next_op_queues:
-                        for q in next_op_queues:
-                            q.put(None)
-                    
-                    break # 退出循环
+                    if current_count >= total_actors:
+                        next_op_name = orchestrator.get_next_op_name(op_name)
+                        if next_op_name:
+                            next_op_queues = actor_queues[next_op_name]
+                            for q in next_op_queues:
+                                q.put(None)
+                    break
                 
                 row_id = data_item.get('_row_id', 'unknown')
                 start_time = time.time()
-                # 注意：我们将 START 日志移到 _process_and_forward_batch 中，以更准确地反映处理开始时间
-                # log_data_flow(row_id, "start", start_time) # 建议移动此行
+                log_data_flow(row_id, "start")
                 
                 batch_buffer.append((data_item, start_time, row_id))
                 
@@ -441,15 +439,13 @@ class RayDataset(DJDataset):
                     next_actor_index += results_count
 
             except queue.Empty:
-                # 修正 #2: 统一调用 flush_buffer 并正确处理返回值
                 results_count = flush_buffer(next_actor_index)
                 next_actor_index += results_count
-                continue # 继续等待下一个数据项
+                continue
             except Exception as e:
                 logger.error(f"Error in {op_name} actor {actor_id}: {e}")
                 break
         
-        # 修正 #3: 最终日志现在会报告正确的计数值
         logger.info(f"Streaming processor for {op_name} actor {actor_id} completed, processed {processed_count} items")
 
     def _process_batch(self, op, actor, batch_data, final_results, result_lock):
@@ -489,9 +485,9 @@ class RayDataset(DJDataset):
         try:
             if isinstance(op, Mapper):
                 try:
+                    print(f"Submitting data to  operation {op._name}")
                     if op.use_cuda():
                         return actor.mapper_cuda_batched.remote(self.transform_to_2d_format(data_item)) if op.is_batched_op() else actor.mapper_cuda.remote(data_item)
-                        # return actor.mapper_cuda_batched.remote(data_item) if op.is_batched_op() else actor.mapper_cuda.remote(data_item)
                     else:
                         if 'cut' in op._name:
                             return actor.mapper_cpu_cut.remote(data_item)
@@ -510,31 +506,30 @@ class RayDataset(DJDataset):
                     raise RuntimeError(f"Error in Filter operation: {str(e)}") from e
 
         except Exception as e:
+            logger.error(f"Error in _submit_to_actor: {str(e)}")
+            raise
 
-            print(f"Error in _submit_to_actor: {str(e)}")
-            raise  
-
-    def _process_and_forward_batch(self, op, actor, batch_data_with_metadata, next_op_queues, 
-                              final_results, result_lock, next_actor_index, log_data_flow):
-        """处理batch数据并转发到下游，带数据流向跟踪"""
+    def _process_and_forward_batch(self, op, actor, batch_data_with_metadata, actor_queues, 
+                              final_results, result_lock, next_actor_index, orchestrator, log_data_flow):
+        """处理batch数据，根据动态路由转发，并进行细粒度日志记录（最终整合版）"""
         if not batch_data_with_metadata:
             return 0
         
-        # 分离数据、开始时间和行号
+        # ### MODIFIED: 重新分离元数据，包括 row_ids ###
         batch_data = [item[0] for item in batch_data_with_metadata]
         start_times = [item[1] for item in batch_data_with_metadata]
         row_ids = [item[2] for item in batch_data_with_metadata]
         
         try:
+            processing_start_time = time.time()
+            
+            # ... (Ray Actor 调用和结果展平逻辑保持不变) ...
             if len(batch_data) == 1:
-                # 单条数据处理
                 future = self._submit_to_actor(op, actor, batch_data[0])
                 results = ray.get(future)
             else:
-                # 批量数据处理
                 futures = [self._submit_to_actor(op, actor, item) for item in batch_data]
                 results = ray.get(futures)
-                # 展平结果
                 flattened_results = []
                 for result in results:
                     if isinstance(result, list):
@@ -542,47 +537,56 @@ class RayDataset(DJDataset):
                     elif result is not None:
                         flattened_results.append(result)
                 results = flattened_results
+
+            time_spent = time.time() - processing_start_time
             
-            # 处理结果
+            # ... (valid_results 处理逻辑保持不变) ...
             valid_results = []
             if isinstance(op, Mapper):
-                if isinstance(results, list):
-                    valid_results = results
-                elif results is not None:
-                    valid_results = [results]
+                if isinstance(results, list): valid_results = results
+                elif results is not None: valid_results = [results]
             elif isinstance(op, Filter):
-                if results:  # Filter返回True的数据
-                    if isinstance(results, list):
-                        valid_results = results
-                    else:
-                        valid_results = [results]
+                if results:
+                    if isinstance(results, list): valid_results = results
+                    else: valid_results = [results]
             
-            # 记录处理结束时间
+            # ### RE-INTRODUCED: 记录每条数据的处理结束 ###
+            # 注意：我们为所有输入数据都记录END，无论它是否被过滤掉
             for row_id, start_time in zip(row_ids, start_times):
                 log_data_flow(row_id, "end", start_time)
+
+            # 向编排器报告批次统计信息
+            orchestrator.report_stats(op._name, len(batch_data), len(valid_results), time_spent)
+
+            # 使用编排器进行动态路由
+            next_op_name = orchestrator.get_next_op_name(op._name)
             
-            # 转发到下游或保存最终结果
-            if next_op_queues and valid_results:
-                # 轮询分发到下游actor
+            if next_op_name and valid_results:
+                next_op_queues = actor_queues[next_op_name]
+                # ### MODIFIED: 确保将正确的 row_id 传递给下游 ###
+                # 这是一个棘手的点：Filter后结果和row_id不再一一对应。
+                # 我们需要将row_id附加到结果字典中。
                 for i, result in enumerate(valid_results):
-                    try:
-                        # 保持行号传递到下游
-                        if isinstance(result, dict):
-                            result['_row_id'] = row_ids[i % len(row_ids)]
-                        
-                        target_queue_idx = (next_actor_index + i) % len(next_op_queues)
-                        next_op_queues[target_queue_idx].put(result)
-                    except Exception as e:
-                        logger.error(f"Error forwarding result to downstream queue: {e}")
-            elif not next_op_queues and valid_results:
-                # 最后一个operator，保存最终结果
+                    # 假设Filter操作返回了原始数据项或其子集
+                    # 我们需要确保_row_id能被传递下去
+                    if isinstance(result, dict) and '_row_id' not in result:
+                        # 这是一个简化处理，假设结果顺序与输入顺序一致。
+                        # 对于复杂的Filter，可能需要在Filter内部保留row_id。
+                        original_item = batch_data[i] # 这是一个潜在的假设
+                        if '_row_id' in original_item:
+                            result['_row_id'] = original_item['_row_id']
+                    
+                    target_queue_idx = (next_actor_index + i) % len(next_op_queues)
+                    next_op_queues[target_queue_idx].put(result)
+
+            elif not next_op_name and valid_results:
                 with result_lock:
                     final_results.extend(valid_results)
             
             return len(valid_results)
             
         except Exception as e:
-            # 出错时也记录结束时间
+            # ### RE-INTRODUCED: 出错时也记录日志 ###
             for row_id, start_time in zip(row_ids, start_times):
                 log_data_flow(row_id, "end", start_time)
             logger.error(f"Error processing and forwarding batch: {e}")
@@ -698,6 +702,37 @@ class RayDataset(DJDataset):
 
             self.data = self.data.map_batches(process_batch_arrow, batch_format="pyarrow")
 
+    # def transform_to_2d_format(self, data):
+    #     if '__dj__source_file__' not in data:
+    #         if 'videos' not in data:
+    #             raise ValueError("数据中缺少 '__dj__source_file__' 字段且无法从 'videos' 字段推断")
+    #         data['__dj__source_file__'] = data['videos']
+    #     data.pop('_row_id', None)
+    #     data.pop('time_pairs', None)
+        
+    #     transformed_data = {}
+        
+    #     for field_name, field_value in data.items():
+    #         if field_name == '__dj__stats__':
+    #             # 特殊处理：保持字典结构
+    #             if isinstance(field_value, list):
+    #                 transformed_data[field_name] = field_value[0] if len(field_value) > 0 else {}
+    #             else:
+    #                 transformed_data[field_name] = field_value
+    #         elif field_name == 'text':
+    #             # text字段不包裹列表
+    #             if isinstance(field_value, list):
+    #                 transformed_data[field_name] = field_value[0] if len(field_value) > 0 else ""
+    #             else:
+    #                 transformed_data[field_name] = field_value
+    #         else:
+    #             # 其他字段：用单层列表包裹
+    #             if isinstance(field_value, list):
+    #                 transformed_data[field_name] = field_value
+    #             else:
+    #                 transformed_data[field_name] = [field_value]
+        
+    #     return transformed_data
     def transform_to_2d_format(self, data):
         if '__dj__source_file__' not in data:
             if 'videos' not in data:
@@ -739,7 +774,6 @@ class RayDataset(DJDataset):
                 transformed_data[field_name] = [field_value] * len(unique_sources)
 
         return transformed_data
-
 
     
     def _run_single_op(self, op):

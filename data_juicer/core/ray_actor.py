@@ -37,6 +37,7 @@ class Actor:
     def mapper_cuda_batched(self, data):
         if not self._model_loaded:
             self.load_model()  # 确保调用前模型已加载
+        print("data:\n", data)
         data = self.op.process_batched_actor(data, self.model, self.processor)
         return data
 
@@ -45,6 +46,7 @@ class Actor:
         processed_data = self.op.detect(data)
         return processed_data
     def mapper_cpu_cut(self, data):
+        print(f"data in mapper_cpu_cut: {data}")
         # 处理数据
         processed_data = self.op.cut(data)
         return processed_data
@@ -53,9 +55,9 @@ class Actor:
             self.load_model()
         data = self.op.compute_stats_single_actor(data, self.model, self.processor)
         keep = self.op.process_single(data)
-        print(f"keep: {keep}")
+        # print(f"keep: {keep}")
         if keep:
-            print(f"data: {data}")
+            # print(f"data: {data}")
             return data
         else:
             return None

@@ -161,7 +161,7 @@ class VideoCaptioningFromFramesMapper(Mapper):
         )
 
     def _process_single_sample_actor(self, ori_sample, model, processor, rank=None, context=False):
-
+        print(f"\n处理单个样本: {ori_sample}")
         # there is no videos in this sample
         if self.video_key not in ori_sample or not ori_sample[self.video_key]:
             return []
@@ -176,7 +176,7 @@ class VideoCaptioningFromFramesMapper(Mapper):
 
         # load videos
         loaded_video_keys = ori_sample[self.video_key]
-        print(f"\n📹 加载的视频列表: {loaded_video_keys}")
+        # print(f"\n📹 加载的视频列表: {loaded_video_keys}")
         sample, videos = load_data_with_context(ori_sample, context,
                                                 loaded_video_keys, load_video)
 
@@ -188,26 +188,26 @@ class VideoCaptioningFromFramesMapper(Mapper):
 
             # video_count = chunk.count(SpecialTokens.video)
             video_count = min(chunk.count(SpecialTokens.video), len(loaded_video_keys) - offset)
-            print(f"  视频 token 数量 (video_count): {video_count}")
-            print(f"  文本内容: {chunk}")
+            # print(f"  视频 token 数量 (video_count): {video_count}")
+            # print(f"  文本内容: {chunk}")
             # no video or no text
             if video_count == 0 or len(chunk.strip()) == 0:
-                print("  ⚠️ 无视频 token 或空文本，跳过")
+                # print("  ⚠️ 无视频 token 或空文本，跳过")
                 continue
             else:
                 text_with_only_special_tokens = remove_non_special_tokens(
                     chunk)
-                print(f"  纯特殊 token 文本: {text_with_only_special_tokens}")
+                # print(f"  纯特殊 token 文本: {text_with_only_special_tokens}")
                 # generate candidate caption(s) in batch manner
                 generated_text_candidates_single_chunk = [
                     [] for _ in range(self.caption_num)
                 ]
-                print(f"  初始化 generated_text_candidates_single_chunk: {generated_text_candidates_single_chunk}")
+                # print(f"  初始化 generated_text_candidates_single_chunk: {generated_text_candidates_single_chunk}")
                 current_video_keys = loaded_video_keys[offset:offset + video_count]
-                print(f"  当前 chunk 对应的视频: {current_video_keys}")
+                # print(f"  当前 chunk 对应的视频: {current_video_keys}")
                 for video_key in loaded_video_keys[offset:offset +
                                                    video_count]:
-                    print(f"\n🎥 处理视频: {video_key}")
+                    # print(f"\n🎥 处理视频: {video_key}")
                     video = videos[video_key]
                     video_frame_videos_chunk = []
                     # extract frame videos
@@ -218,11 +218,11 @@ class VideoCaptioningFromFramesMapper(Mapper):
                             video, self.frame_num)
                     else:
                         frames = []
-                    print(f"  提取的帧数: {len(frames)}")
+                    # print(f"  提取的帧数: {len(frames)}")
                     frame_videos = [frame.to_image() for frame in frames]
-                    print(f"  有效帧数 (转换为图像后): {len(frame_videos)}")
+                    # print(f"  有效帧数 (转换为图像后): {len(frame_videos)}")
                     if not frame_videos:
-                        print("  ⚠️ 无有效帧，填充空字符串")
+                        # print("  ⚠️ 无有效帧，填充空字符串")
                         for i in range(self.caption_num):
                             generated_text_candidates_single_chunk[i].append("")
                         continue
@@ -262,12 +262,12 @@ class VideoCaptioningFromFramesMapper(Mapper):
                             generated_text_candidates_single_chunk[i] += [
                                 '. '.join([txt.strip() for txt in generated_text])
                             ]
-                    print(f"  生成文本候选: {generated_text_candidates_single_chunk}")
-                print(f"\n📊 生成文本候选列表长度检查:")
+                    # print(f"  生成文本候选: {generated_text_candidates_single_chunk}")
+                # print(f"\n📊 生成文本候选列表长度检查:")
                 for i, captions in enumerate(generated_text_candidates_single_chunk):
-                    print(f"  候选列表 {i}: 长度={len(captions)}, 内容={captions}")
+                    # print(f"  候选列表 {i}: 长度={len(captions)}, 内容={captions}")
                     if len(captions) < video_count:
-                        print(f"  ⚠️ 长度不足 {video_count}，填充空字符串")
+                        # print(f"  ⚠️ 长度不足 {video_count}，填充空字符串")
                         captions.extend([""] * (video_count - len(captions)))
                 # 3. insert a list of generated captions into the positions of
                 # subsequent placeholders in the original string
@@ -280,17 +280,17 @@ class VideoCaptioningFromFramesMapper(Mapper):
 
                 # reduce the captions according to given mode video by video
                 for j in range(video_count):
-                    print(f"  处理视频 {j}:")
+                    # print(f"  处理视频 {j}:")
                     try:
                         current_captions = [captions[j] for captions in generated_text_candidates_single_chunk]
-                        print(f"  当前候选: {current_captions}")
+                        # print(f"  当前候选: {current_captions}")
                         new_generated_text_per_video = self._reduce_captions(chunk, current_captions)
-                        print(f"  减少后结果: {new_generated_text_per_video}")
+                        # print(f"  减少后结果: {new_generated_text_per_video}")
                         for i in range(len(new_generated_text_per_video)):
                             new_generated_text_all_videos[i].append(new_generated_text_per_video[i])
                     except IndexError as e:
-                        print(f"  ❌ 发生 IndexError: {e}")
-                        print(f"  generated_text_candidates_single_chunk 结构: {generated_text_candidates_single_chunk}")
+                        # print(f"  ❌ 发生 IndexError: {e}")
+                        # print(f"  generated_text_candidates_single_chunk 结构: {generated_text_candidates_single_chunk}")
                         raise
 
                 # insert the captions according to given mode
@@ -305,7 +305,7 @@ class VideoCaptioningFromFramesMapper(Mapper):
                         self.
                         text_key] += f'{generated_text_per_chunk}' \
                                      f'{SpecialTokens.eoc}'
-                    print(f"  生成样本 {i} 的文本: {generated_samples[i][self.text_key]}")
+                    # print(f"  生成样本 {i} 的文本: {generated_samples[i][self.text_key]}")
                 offset += video_count
 
         if not context:
@@ -396,7 +396,7 @@ class VideoCaptioningFromFramesMapper(Mapper):
     
 
     def _process_single_sample(self, ori_sample, rank=None, context=False):
-
+        print(f"\n处理单个样本: {ori_sample}")
         # there is no videos in this sample
         if self.video_key not in ori_sample or not ori_sample[self.video_key]:
             return []

@@ -117,7 +117,7 @@ class RayExecutor(ExecutorBase):
             logger.info("Processing data...")
             tstart = time.time()
             if self.op_enable_parallel:
-                dataset.process_parallel(ops)
+                dataset.process_parallel(ops, reorder_batch_size=1000)
             else:
                 dataset.process(ops)
 

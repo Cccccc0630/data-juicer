@@ -240,48 +240,53 @@ class VideoSplitBySceneMapper(Mapper):
         if 'time_pairs' not in sample or not sample['time_pairs']:
             return sample
 
-        # 获取 time_pairs
         time_pairs = sample['time_pairs']
-        cut_video_dict = {}  # 改为字典存储列表，格式: {原始路径: [切割后路径1, 切割后路径2, ...]}
-        source_files = []     # 存储所有原始文件路径（保持与切割后路径的顺序一致）
+        cut_video_dict = {}  # {原始路径: [切割后路径1, 切割后路径2, ...]}
+        source_files = []    # 对应原始视频路径，按切片顺序
+
+        # 用于每个视频的 scene_number 计数
+        scene_counters = {}
 
         for pair in time_pairs:
             video_key = pair['video_path']
             start_time = pair['start_time']
             end_time = pair['end_time']
 
-            # 构建 scene_list：直接使用 FrameTime 对象
-            scene_list = [(start_time, end_time)]
+            # 初始化计数器
+            if video_key not in scene_counters:
+                scene_counters[video_key] = 0
+                cut_video_dict[video_key] = []
 
-            # 构造输出文件路径
-            output_path = add_suffix_to_filename(
-                video_key, 
-                f"_start_{start_time.get_seconds()}_end_{end_time.get_seconds()}"
-            )
+            # 构造输出路径模板，使用 $SCENE_NUMBER
+            redirected_video_key = transfer_filename(video_key, OP_NAME, **self._init_parameters)
+            output_template = add_suffix_to_filename(redirected_video_key, "_$SCENE_NUMBER")
 
-            # 使用 scenedetect 进行视频切割
+            # 每个切片编号
+            scene_counters[video_key] += 1
+            scene_num_format = f"%0{max(3, math.floor(math.log(len(time_pairs), 10)) + 1)}d"
+            output_path = output_template.replace("$SCENE_NUMBER", scene_num_format % scene_counters[video_key])
+
+            print(f"Cutting video '{video_key}' -> '{output_path}'")
+
+            # 使用 scenedetect 切割视频
             scenedetect.split_video_ffmpeg(
                 input_video_path=video_key,
-                scene_list=scene_list,
+                scene_list=[(start_time, end_time)],
                 output_file_template=output_path,
                 show_progress=self.show_progress,
             )
 
-            # 更新字典：如果键不存在则初始化列表，然后追加新路径
-            if video_key not in cut_video_dict:
-                cut_video_dict[video_key] = []
+            # 更新字典
             cut_video_dict[video_key].append(output_path)
             source_files.append(video_key)
 
-        # 展平所有切割后的路径（保持与time_pairs相同的顺序）
-        all_cut_paths = [
-            path for sublist in cut_video_dict.values() 
-            for path in sublist
-        ]
-
-        # 更新 sample 中的 video_key 和 source_file
+        # 展平切割后路径
+        all_cut_paths = list(chain.from_iterable(cut_video_dict.values()))
+        print(f"All cut paths: {all_cut_paths}")
+        # 更新 sample
         sample[self.video_key] = all_cut_paths
         sample[Fields.source_file] = source_files
 
+        # 保留原有 time_pairs
         print("Cutting result:", sample)
         return sample
