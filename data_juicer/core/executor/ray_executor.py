@@ -87,7 +87,7 @@ class RayExecutor(ExecutorBase):
             **self.cfg.export_extra_args,
         )
         self.op_enable_parallel = True
-        # self.op_enable_parallel = False
+        self.op_enable_parallel = False
 
     def run(self, load_data_np: Optional[PositiveInt] = None, skip_return=False):
         """

@@ -860,6 +860,7 @@ class RayDataset(DJDataset):
             traceback.print_exc()
             exit(1)
 
+
     @classmethod
     def read(cls, data_format: str, paths: Union[str, List[str]]) -> RayDataset:
         if data_format in {"json", "jsonl"}:

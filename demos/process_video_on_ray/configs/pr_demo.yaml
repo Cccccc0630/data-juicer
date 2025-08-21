@@ -8,7 +8,8 @@ ray_address: 'auto'                     # change to your ray cluster address, e.
 dataset:
   configs:
     - type: local
-      path: './demos/process_video_on_ray/data/demo-dataset.jsonl'  # path to your dataset directory or file
+      # path: './demos/process_video_on_ray/data/demo-dataset_*10.jsonl'  # path to your dataset directory or file
+      path: './demos/process_video_on_ray/data/demo-dataset.jsonl' 
 export_path: './outputs/demo/process_video_on_ray/demo-dataset'
 
 
@@ -22,6 +23,22 @@ process:
       min_scene_len: 10                                       # minimum length of any scene
       show_progress: false                                     # whether to show progress from scenedetect
   # # Filter ops
+  - video_resolution_filter:                                # filter samples according to the resolution of videos in them
+      min_width: 1280                                         # the min resolution of horizontal resolution filter range (unit p)
+      max_width: 4096                                         # the max resolution of horizontal resolution filter range (unit p)
+      min_height: 480                                         # the min resolution of vertical resolution filter range (unit p)
+      max_height: 1080                                        # the max resolution of vertical resolution filter range (unit p)
+      any_or_all: any                                         # keep this sample when any/all videos meet the filter condition
+  - video_aspect_ratio_filter:                              # filter samples according to the aspect ratios of videos (a fraction of width by height, r=w/h) in them
+      min_ratio: 9/21                                         # the minimum aspect ratio to keep samples, supported format is a string, such as "9:21" or "9/21".
+      max_ratio: 21/9                                         # the maximum aspect ratio to keep samples, supported format is a string, such as "21:9" or "21/9".
+      any_or_all: any                                         # keep this sample when any/all videos meet the filter condition
+  - video_ocr_area_ratio_filter:                            # Keep data samples whose detected text area ratios for specified frames in the video are within a specified range.
+      min_area_ratio: 0                                       # the min ocr area ratio to keep samples. It's 0 by default.
+      max_area_ratio: 0                                     # the max ocr area ratio to keep samples. It's 1.0 by default.
+      frame_sample_num: 3                                     # the number of sampled frames to calculate the ocr area ratio. If it's 1, only middle frame will be selected. If it's 2, only the first and the last frames will be selected. If it's larger than 2, in addition to the first and the last frames, other frames will be sampled evenly within the video duration.
+      languages_to_detect: ['ch_sim', 'en']                   # texts in which languages should be detected. Default: ['ch_sim', 'en']. Full language list can be found here: https://www.jaided.ai/easyocr/.
+      any_or_all: all                                         # keep this sample with 'any' or 'all' strategy of all videos. 'any': keep this sample if any videos meet the condition. 'all': keep this sample only if all videos meet the condition.
   - video_aesthetics_filter:                                # filter samples according to the aesthetics score of frame images extracted from videos.
       hf_scorer_model: shunk031/aesthetics-predictor-v2-sac-logos-ava1-l14-linearMSE # Huggingface model name for the aesthetics predictor
       min_score: 0.3                                          # the min aesthetics score of filter range
@@ -32,15 +49,16 @@ process:
       any_or_all: any                                         # keep this sample when any/all images meet the filter condition
       mem_required: '1500MB'                                  # This operation (Op) utilizes deep neural network models that consume a significant amount of memory for computation, hence the system's available memory might constrain the maximum number of processes that can be launched
       gpu_required: 0.1
-  # - video_watermark_filter:                                 # filter samples according to the predicted watermark probabilities of videos in them
-  #     hf_watermark_model: amrul-hzz/watermark_detector        # Huggingface model name for watermark classification
-  #     prob_threshold: 0.8                                     # the predicted watermark probability threshold for samples, range from 0 to 1. Samples with watermark probability less than this threshold will be kept.
-  #     frame_sampling_method: all_keyframes                    # sampling method of extracting frame images from the videos. Should be one of ["all_keyframes", "uniform"]. The former one extracts all key frames and the latter one extract specified number of frames uniformly from the video. Default: "all_keyframes".
-  #     frame_num: 3                                            # the number of frames to be extracted uniformly from the video. Only works when frame_sampling_method is "uniform". If it's 1, only the middle frame will be extracted. If it's 2, only the first and the last frames will be extracted. If it's larger than 2, in addition to the first and the last frames, other frames will be extracted uniformly within the video duration.
-  #     reduce_mode: avg                                        # reduce mode for multiple sampled video frames to compute final predicted watermark probabilities of videos, must be one of ['avg','max', 'min'].
-  #     any_or_all: any                                         # keep this sample when any/all images meet the filter condition
-  #     mem_required: '500MB'                                   # This operation (Op) utilizes deep neural network models that consume a significant amount of memory for computation, hence the system's available memory might constrain the maximum number of processes that can be launched
-  #     gpu_required: 0.5
+  - video_motion_score_raft_filter:                         # Keep samples with video motion scores (based on RAFT model) within a specific range.
+      min_score: 1.0                                          # the minimum motion score to keep samples
+      max_score: 10000.0                                      # the maximum motion score to keep samples
+      sampling_fps: 2                                         # the samplig rate of frames_per_second to compute optical flow
+      size: null                                              # resize frames along the smaller edge before computing optical flow, or a sequence like (h, w)
+      max_size: null                                          # maximum allowed for the longer edge of resized frames
+      divisible: 8                                            # The number that the dimensions must be divisible by.
+      relative: false                                         # whether to normalize the optical flow magnitude to [0, 1], relative to the frame's diagonal length
+      any_or_all: any                                         # keep this sample when any/all videos meet the filter condition
+  # Mapper ops
   - video_captioning_from_frames_mapper:                    # generate samples whose captions are generated based on an image-to-text model and sampled video frames. Captions from different frames will be concatenated to a single string.
       hf_img2seq: 'Salesforce/blip2-opt-2.7b'                 # image-to-text model name on huggingface to generate caption
       caption_num: 1                                          # how many candidate captions to generate for each video
