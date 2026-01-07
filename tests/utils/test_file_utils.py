@@ -14,12 +14,14 @@ from data_juicer.utils.unittest_utils import DataJuicerTestCaseBase
 class FileUtilsTest(DataJuicerTestCaseBase):
 
     def setUp(self) -> None:
+        super().setUp()
         self.temp_output_path = 'tmp/test_file_utils/'
         os.makedirs(self.temp_output_path)
 
     def tearDown(self):
         if os.path.exists(self.temp_output_path):
             os.system(f'rm -rf {self.temp_output_path}')
+        super().tearDown()
 
     def test_find_files_with_suffix(self):
         # prepare test files

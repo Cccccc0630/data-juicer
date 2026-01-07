@@ -2,19 +2,28 @@
 
 ## 前置条件
 
-- Python >= 3.10
+- Python >= 3.10 & <= 3.12
 - Git (用于源码安装)
 - uv (推荐的包安装器)
+  - uv 可以通过以下方式安装：
+
+```bash
+# 使用 curl
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 或者使用 pip
+pip install uv
+```
 
 ## 基础安装
 
-Data-Juicer 现已上架 PyPI。最小安装包含核心数据处理能力：
+Data-Juicer 已上架 PyPI：
 
 ```bash
-pip install py-data-juicer
+uv pip install py-data-juicer
 ```
 
-这将提供：
+最小安装包含核心数据处理能力，这将提供：
 - 数据加载和操作
 - 文件系统操作
 - 并行处理
@@ -26,7 +35,7 @@ pip install py-data-juicer
 **核心 ML & DL**
 ```bash
 # 通用 ML/DL 能力
-pip install "py-data-juicer[generic]"
+uv pip install "py-data-juicer[generic]"
 ```
 包括：PyTorch、Transformers、VLLM 等。
 
@@ -34,70 +43,66 @@ pip install "py-data-juicer[generic]"
 
 ```bash
 # 计算机视觉
-pip install "py-data-juicer[vision]"
+uv pip install "py-data-juicer[vision]"
 
 # 自然语言处理
-pip install "py-data-juicer[nlp]"
+uv pip install "py-data-juicer[nlp]"
 
 # 音频处理
-pip install "py-data-juicer[audio]"
+uv pip install "py-data-juicer[audio]"
 
 **附加组件**
 
 ```bash
 # 分布式计算
-pip install "py-data-juicer[distributed]"
+uv pip install "py-data-juicer[distributed]"
 
 # AI 服务和 API
-pip install "py-data-juicer[ai_services]"
+uv pip install "py-data-juicer[ai_services]"
 
 **开发工具**
 ```bash
 # 开发和测试
-pip install "py-data-juicer[dev]"
+uv pip install "py-data-juicer[dev]"
 ```
 
 ## 常见安装模式
 
 **1. 文本处理设置**
 ```bash
-pip install "py-data-juicer[generic,nlp]"
+uv pip install "py-data-juicer[generic,nlp]"
 ```
 
 **2. 视觉处理设置**
 ```bash
-pip install "py-data-juicer[generic,vision]"
+uv pip install "py-data-juicer[generic,vision]"
 ```
 
 **3. 完整处理流程**
 ```bash
-pip install "py-data-juicer[generic,nlp,vision,distributed]"
+uv pip install "py-data-juicer[generic,nlp,vision,distributed]"
 ```
 
 **4. 完整安装**
 ```bash
 # 安装所有功能（除沙盒外）
-pip install "py-data-juicer[all]"
+uv pip install "py-data-juicer[all]"
 ```
 
-**5. 开发模式**
+## 从源码安装
 
-对于贡献者和开发者：
-
+如果想要使用最新的特性与更新，也可以从源码安装 Data-Juicer：
 ```bash
 # 克隆仓库
-git clone https://github.com/modelscope/data-juicer.git
+git clone https://github.com/datajuicer/data-juicer.git
 cd data-juicer
+uv pip install -e .
 
-# 安装开发依赖
-pip install -e ".[dev]"
-
-# 可选：使用 uv 进行虚拟环境和依赖管理
-curl -LsSf https://astral.sh/uv/install.sh | sh   # 安装 uv
-uv venv --python 3.10                             # 使用 Python 3.10 初始化虚拟环境
-source .venv/bin/activate                         # 激活虚拟环境
-uv pip install -e .                               # 安装最小依赖
+# 同样也可以安装指定的额外领域的依赖
+uv pip install -e ".[vision]"
 ```
+
+**注意：**从源码安装时，建议使用 `-e` 模式打开开发模式。
 
 ## 特定算子安装
 除了基于场景的安装外，我们还提供基于算子和基于菜谱的安装方式。

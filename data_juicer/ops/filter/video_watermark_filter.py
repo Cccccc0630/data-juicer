@@ -24,10 +24,16 @@ OP_NAME = "video_watermark_filter"
 @LOADED_VIDEOS.register_module(OP_NAME)
 @INTER_SAMPLED_FRAMES.register_module(OP_NAME)
 class VideoWatermarkFilter(Filter):
-    """
-    Filter to keep samples whose videos have no watermark with high
-    probability.
-    """
+    """Filter to keep samples whose videos have no watermark with high probability.
+
+    This operator uses a Hugging Face watermark detection model to predict the probability
+    of watermarks in video frames. It keeps samples where the predicted watermark
+    probability is below a specified threshold. The key metric, 'video_watermark_prob', is
+    computed by extracting frames from the video using a specified sampling method and then
+    averaging, maximizing, or minimizing the probabilities based on the reduce mode. If
+    multiple videos are present, the operator can use either an 'any' or 'all' strategy to
+    determine if the sample should be kept. The frame sampling method can be 'all_keyframes'
+    or 'uniform', and the reduce mode can be 'avg', 'max', or 'min'."""
 
     _accelerator = "cuda"
 
@@ -48,6 +54,7 @@ class VideoWatermarkFilter(Filter):
 
         :param hf_watermark_model: watermark detection model name on
             huggingface.
+        :param trust_remote_code: whether to trust the remote code of HF models.
         :param prob_threshold: the predicted watermark probability threshold
             for samples. range from 0 to 1. Samples with watermark probability
             less than this threshold will be kept.
@@ -75,7 +82,7 @@ class VideoWatermarkFilter(Filter):
         :param args: extra args
         :param kwargs: extra args
         """
-        kwargs.setdefault("mem_required", "500MB")
+        kwargs["memory"] = "500MB" if kwargs.get("memory", 0) == 0 else kwargs["memory"]
         super().__init__(*args, **kwargs)
         self.prob_threshold = prob_threshold
         if frame_sampling_method not in ["all_keyframes", "uniform"]:
@@ -103,6 +110,69 @@ class VideoWatermarkFilter(Filter):
         self.sampled_frames_key_suffix = f"-{frame_sampling_method}" + (
             "" if frame_sampling_method == "all_keyframes" else f"-{frame_num}"
         )
+
+    def compute_stats_single_actor(self, sample, model, processor, rank=None, context=False):
+        # check if it's computed already
+        if StatsKeys.video_watermark_prob in sample[Fields.stats]:
+            return sample
+
+        # there is no videos in this sample
+        if self.video_key not in sample or not sample[self.video_key]:
+            sample[Fields.stats][StatsKeys.video_watermark_prob] = np.array([], dtype=np.float64)
+            return sample
+
+        # load videos
+        loaded_video_keys = sample[self.video_key]
+        sample, videos = load_data_with_context(sample, context, loaded_video_keys, load_video)
+
+        watermark_probs = []
+        # model, processor = get_model(self.model_key, rank, self.use_cuda())
+
+        for video_key, video in videos.items():
+            sampled_frames_key = video_key + self.sampled_frames_key_suffix
+
+            # extract frame images
+            if context and sampled_frames_key in sample[Fields.context]:
+                frames = sample[Fields.context][sampled_frames_key]
+            else:
+                if self.frame_sampling_method == "all_keyframes":
+                    frames = extract_key_frames(video)
+                elif self.frame_sampling_method == "uniform":
+                    frames = extract_video_frames_uniformly(video, self.frame_num)
+                else:
+                    frames = []
+
+                # store the sampled frames in the context
+                if context:
+                    sample[Fields.context][sampled_frames_key] = frames
+
+            frame_images = [frame.to_image() for frame in frames]
+
+            if len(frame_images) > 0:
+                inputs = processor(images=frame_images, return_tensors="pt")
+                inputs = inputs.to(model.device)
+                outputs = model(**inputs)
+                logits = outputs.logits
+                cur_probs = [probs[1] for probs in torch.softmax(logits, dim=-1)]
+                cur_probs = torch.Tensor(cur_probs)
+
+                if self.reduce_mode == "avg":
+                    cur_prob = cur_probs.mean()
+                elif self.reduce_mode == "max":
+                    cur_prob = cur_probs.max()
+                else:
+                    cur_prob = cur_probs.min()
+            else:
+                cur_prob = 0.0
+            watermark_probs.append(float(cur_prob))
+
+        sample[Fields.stats][StatsKeys.video_watermark_prob] = watermark_probs
+
+        if not context:
+            for vid_key in videos:
+                close_video(videos[vid_key])
+
+        return sample
 
     def compute_stats_single(self, sample, rank=None, context=False):
         # check if it's computed already
@@ -172,7 +242,7 @@ class VideoWatermarkFilter(Filter):
         if len(itm_probs) <= 0:
             return True
 
-        keep_bools = np.array([itm_prob < self.prob_threshold for itm_prob in itm_probs])
+        keep_bools = np.array([self.get_keep_boolean(itm_prob, None, self.prob_threshold) for itm_prob in itm_probs])
 
         # different strategies
         if self.any:

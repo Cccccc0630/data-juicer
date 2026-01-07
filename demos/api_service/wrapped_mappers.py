@@ -23,7 +23,7 @@ def execute_image_caption_mapper(dataset_path: str) -> ServiceResponse:
             "image_captioning_mapper",
             hf_img2seq=img2seq_model_path,
             keep_original_sample=False,
-            mem_required="16GB",
+            memory="16GB",
         )
         result_path = execute_config(dj_config)
         return ServiceResponse(ServiceExecStatus.SUCCESS, f"Mapped dataset path: {result_path}")
@@ -46,7 +46,7 @@ def execute_image_diffusion_mapper(dataset_path: str) -> ServiceResponse:
             hf_diffusion=diffusion_model_path,
             keep_original_sample=False,
             caption_key="text",
-            mem_required="8GB",
+            memory="8GB",
         )
         result_path = execute_config(dj_config)
         return ServiceResponse(ServiceExecStatus.SUCCESS, f"Mapped dataset path: {result_path}")
@@ -84,7 +84,7 @@ def execute_video_caption_mapper(dataset_path: str) -> ServiceResponse:
             "video_captioning_from_video_mapper",
             keep_original_sample=False,
             hf_video_blip=video_blip_model_path,
-            mem_required="20GB",
+            memory="20GB",
         )
         result_path = execute_config(dj_config)
         return ServiceResponse(ServiceExecStatus.SUCCESS, f"Mapped dataset path: {result_path}")

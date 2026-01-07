@@ -7,7 +7,6 @@ from jsonargparse import Namespace
 from loguru import logger
 from pydantic import PositiveInt
 
-from data_juicer.core.adapter import Adapter
 from data_juicer.core.data.dataset_builder import DatasetBuilder
 from data_juicer.core.executor import ExecutorBase
 from data_juicer.core.ray_exporter import RayExporter
@@ -53,11 +52,16 @@ class RayExecutor(ExecutorBase):
         super().__init__(cfg)
         self.executor_type = "ray"
         self.work_dir = self.cfg.work_dir
-        self.adapter = Adapter(self.cfg)
+        # TODO: support ray
+        # self.adapter = Adapter(self.cfg)
 
         # init ray
         logger.info("Initializing Ray ...")
-        ray.init(self.cfg.ray_address, ignore_reinit_error=True)
+
+        from data_juicer.utils.ray_utils import initialize_ray
+
+        initialize_ray(cfg=cfg, force=True)
+
         self.tmp_dir = os.path.join(self.work_dir, ".tmp", ray.get_runtime_context().get_job_id())
 
         # absolute path resolution logic
@@ -66,26 +70,56 @@ class RayExecutor(ExecutorBase):
         self.datasetbuilder = DatasetBuilder(self.cfg, executor_type="ray")
 
         logger.info("Preparing exporter...")
+        # Prepare export extra args, including S3 credentials if export_path is S3
+        export_extra_args = dict(self.cfg.export_extra_args) if hasattr(self.cfg, "export_extra_args") else {}
+
+        # If export_path is S3, extract AWS credentials with priority:
+        # 1. export_aws_credentials (export-specific)
+        # 2. dataset config (for backward compatibility)
+        # 3. environment variables (handled by exporter)
+        if self.cfg.export_path.startswith("s3://"):
+            # Pass export-specific credentials if provided.
+            # The RayExporter will handle falling back to environment variables or other credential mechanisms.
+            if hasattr(self.cfg, "export_aws_credentials") and self.cfg.export_aws_credentials:
+                export_aws_creds = self.cfg.export_aws_credentials
+                # Iterate through the required fields directly, and copy them to export_extra_args if they exist.
+                credential_fields = {
+                    "aws_access_key_id",
+                    "aws_secret_access_key",
+                    "aws_session_token",
+                    "aws_region",
+                    "endpoint_url",
+                }
+                for field in credential_fields.intersection(export_aws_creds):
+                    export_extra_args[field] = export_aws_creds[field]
+
         self.exporter = RayExporter(
             self.cfg.export_path,
             self.cfg.export_type,
+            self.cfg.export_shard_size,
             keep_stats_in_res_ds=self.cfg.keep_stats_in_res_ds,
             keep_hashes_in_res_ds=self.cfg.keep_hashes_in_res_ds,
-            **self.cfg.export_extra_args,
+            **export_extra_args,
         )
+        # Process data with parallel operators
+        self.op_enable_parallel = True
+        # self.op_enable_parallel = False
 
-    def run(self, load_data_np: Optional[PositiveInt] = None, skip_return=False):
+    def run(self, load_data_np: Optional[PositiveInt] = None, skip_export: bool = False, skip_return: bool = False):
         """
         Running the dataset process pipeline
 
         :param load_data_np: number of workers when loading the dataset.
+        :param skip_export: whether export the results into disk
         :param skip_return: skip return for API called.
         :return: processed dataset.
         """
         # 1. load data
         logger.info("Loading dataset with Ray...")
+        dstart = time.time()
         dataset = self.datasetbuilder.load_dataset(num_proc=load_data_np)
-        columns = dataset.schema().columns
+        logger.info(f"Data loading in {time.time() - dstart:.3f}")
+        columns = dataset.data.columns()
 
         # 2. extract processes
         logger.info("Preparing process operators...")
@@ -99,11 +133,15 @@ class RayExecutor(ExecutorBase):
             # 3. data process
             logger.info("Processing data...")
             tstart = time.time()
-            dataset.process(ops)
+            if self.op_enable_parallel:
+                dataset.process_parallel(ops)
+            else:
+                dataset.process(ops)
 
             # 4. data export
-            logger.info("Exporting dataset to disk...")
-            self.exporter.export(dataset.data, columns=columns)
+            if not skip_export:
+                logger.info("Exporting dataset to disk...")
+                self.exporter.export(dataset.data, columns=columns)
             tend = time.time()
             logger.info(f"All Ops are done in {tend - tstart:.3f}s.")
 

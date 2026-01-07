@@ -27,6 +27,7 @@ from data_juicer.utils.unittest_utils import DataJuicerTestCaseBase
 class MMTest(DataJuicerTestCaseBase):
 
     def setUp(self) -> None:
+        super().setUp()
         data_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                                  '..',
                                  'ops',
@@ -40,6 +41,7 @@ class MMTest(DataJuicerTestCaseBase):
     def tearDown(self):
         if os.path.exists(self.temp_output_path):
             os.system(f'rm -rf {self.temp_output_path}')
+        super().tearDown()
 
     def test_special_tokens(self):
         self.assertEqual(

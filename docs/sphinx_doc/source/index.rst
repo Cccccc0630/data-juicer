@@ -13,56 +13,12 @@ Data Processing for and with Foundation Models
 
 .. toctree::
    :maxdepth: 2
-   :caption: Tutorial
-   :glob:
    :hidden:
 
-   docs/tutorial/*
+   docs_index
 
 .. toctree::
    :maxdepth: 2
-   :caption: docs
-   :glob:
-   :hidden:
-
-   docs/Operators
-   docs/RecipeGallery
-   docs/DatasetCfg
-   docs/*
-
-.. toctree::
-   :maxdepth: 2
-   :caption: demos
-   :glob:
-   :hidden:
-
-   demos/*
-   demos/**/*
-
-.. toctree::
-   :maxdepth: 2
-   :caption: tools
-   :glob:
-   :hidden:
-
-   tools/*
-   tools/**/*
-
-.. toctree::
-   :maxdepth: 2
-   :caption: thirdparty
-   :glob:
-   :hidden:
-
-   thirdparty/*
-   thirdparty/**/*
-
-.. toctree::
-   :maxdepth: 2
-   :caption: API Reference
    :hidden:
 
    api
-
-
-

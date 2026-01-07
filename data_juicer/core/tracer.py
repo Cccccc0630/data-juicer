@@ -4,6 +4,9 @@ import pandas as pd
 from datasets import Dataset
 from loguru import logger
 
+from data_juicer.ops import OPERATORS
+from data_juicer.utils.constant import Fields
+
 
 class Tracer:
     """
@@ -13,18 +16,25 @@ class Tracer:
     The comparison results will be stored in the work directory.
     """
 
-    def __init__(self, work_dir, show_num=10):
+    def __init__(self, work_dir, op_list_to_trace=None, show_num=10):
         """
         Initialization method.
 
         :param work_dir: the work directory to store the comparison
             results
+        :param op_list_to_trace: the OP list to be traced.
         :param show_num: the maximum number of samples to show in the
             comparison result files.
         """
         self.work_dir = os.path.join(work_dir, "trace")
         if not os.path.exists(self.work_dir):
             os.makedirs(self.work_dir)
+        self.op_list_to_trace = op_list_to_trace
+        if not op_list_to_trace:
+            logger.info("Trace for all ops.")
+            self.op_list_to_trace = set(OPERATORS.modules.keys())
+        else:
+            self.op_list_to_trace = set(op_list_to_trace)
         self.show_num = show_num
 
     def trace_mapper(self, op_name: str, previous_ds: Dataset, processed_ds: Dataset, text_key: str):
@@ -40,6 +50,9 @@ class Tracer:
         :param text_key: which text_key to trace
         :return:
         """
+        if op_name not in self.op_list_to_trace:
+            return
+
         assert len(previous_ds) == len(processed_ds)
         dif_dict = []
         num = 0
@@ -91,6 +104,9 @@ class Tracer:
         :param text_key: which text_key to trace
         :return:
         """
+        if op_name not in self.op_list_to_trace:
+            return
+
         assert previous_ds[0][text_key] == processed_ds[0][text_key]
         aug_dict = []
 
@@ -120,6 +136,9 @@ class Tracer:
         :param processed_ds: dataset processed by the filter
         :return:
         """
+        if op_name not in self.op_list_to_trace:
+            return
+
         if len(previous_ds) == len(processed_ds):
             logger.warning(
                 f"Datasets before and after op [{op_name}] are all "
@@ -136,8 +155,14 @@ class Tracer:
         # number of found filtered samples. It's the offset between two
         # datasets as well.
         num = 0
+        previous_ds_no_stats = (
+            previous_ds.remove_columns(Fields.stats) if Fields.stats in previous_ds.column_names else previous_ds
+        )
+        processed_ds_no_stats = (
+            processed_ds.remove_columns(Fields.stats) if Fields.stats in processed_ds.column_names else processed_ds
+        )
         while i < len(previous_ds):
-            if i - num >= len(processed_ds) or previous_ds[i] != processed_ds[i - num]:
+            if i - num >= len(processed_ds) or previous_ds_no_stats[i] != processed_ds_no_stats[i - num]:
                 # 1. If all samples in processed dataset are checked but there
                 # still some samples left in the previous dataset, all of these
                 # left samples are filtered.
@@ -178,6 +203,9 @@ class Tracer:
             deduplicator
         :return:
         """
+        if op_name not in self.op_list_to_trace:
+            return
+
         if dup_pairs is None:
             logger.warning(
                 f"Op [{op_name}] does not generate dup_pairs "

@@ -1,5 +1,6 @@
 import argparse
 import copy
+import importlib.util
 import json
 import os
 import shutil
@@ -24,8 +25,10 @@ from loguru import logger
 
 from data_juicer.ops.base_op import OPERATORS
 from data_juicer.ops.op_fusion import FUSION_STRATEGIES
+from data_juicer.utils.constant import RAY_JOB_ENV_VAR
 from data_juicer.utils.logger_utils import setup_logger
 from data_juicer.utils.mm_utils import SpecialTokens
+from data_juicer.utils.ray_utils import is_ray_mode
 
 global_cfg = None
 global_parser = None
@@ -38,6 +41,59 @@ def timing_context(description):
     elapsed_time = time.time() - start_time
     # Use a consistent format that won't be affected by logger reconfiguration
     logger.debug(f"{description} took {elapsed_time:.2f} seconds")
+
+
+def _generate_module_name(abs_path):
+    """Generate a module name based on the absolute path of the file."""
+    return os.path.splitext(os.path.basename(abs_path))[0]
+
+
+def load_custom_operators(paths):
+    """Dynamically load custom operator modules or packages in the specified path."""
+    for path in paths:
+        abs_path = os.path.abspath(path)
+        if os.path.isfile(abs_path):
+            module_name = _generate_module_name(abs_path)
+            if module_name in sys.modules:
+                existing_path = sys.modules[module_name].__file__
+                raise RuntimeError(
+                    f"Module '{module_name}' already loaded from '{existing_path}'. "
+                    f"Conflict detected while loading '{abs_path}'."
+                )
+            try:
+                spec = importlib.util.spec_from_file_location(module_name, abs_path)
+                if spec is None:
+                    raise RuntimeError(f"Failed to create spec for '{abs_path}'")
+                module = importlib.util.module_from_spec(spec)
+                # register the module first to avoid recursive import issues
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+            except Exception as e:
+                raise RuntimeError(f"Error loading '{abs_path}' as '{module_name}': {e}")
+
+        elif os.path.isdir(abs_path):
+            if not os.path.isfile(os.path.join(abs_path, "__init__.py")):
+                raise ValueError(f"Package directory '{abs_path}' must contain __init__.py")
+            package_name = os.path.basename(abs_path)
+            parent_dir = os.path.dirname(abs_path)
+            if package_name in sys.modules:
+                existing_path = sys.modules[package_name].__path__[0]
+                raise RuntimeError(
+                    f"Package '{package_name}' already loaded from '{existing_path}'. "
+                    f"Conflict detected while loading '{abs_path}'."
+                )
+            original_sys_path = sys.path.copy()
+            try:
+                sys.path.insert(0, parent_dir)
+                importlib.import_module(package_name)
+                # record the loading path of the package (for subsequent conflict detection)
+                sys.modules[package_name].__loaded_from__ = abs_path
+            except Exception as e:
+                raise RuntimeError(f"Error loading package '{abs_path}': {e}")
+            finally:
+                sys.path = original_sys_path
+        else:
+            raise ValueError(f"Path '{abs_path}' is neither a file nor a directory")
 
 
 def init_configs(args: Optional[List[str]] = None, which_entry: object = None, load_configs_only=False):
@@ -134,7 +190,8 @@ def init_configs(args: Optional[List[str]] = None, which_entry: object = None, l
                 type=Union[List[Dict], Dict],
                 default=[],
                 help="Dataset setting to define local/remote datasets; could be a "  # noqa: E251
-                "dict or a list of dicts; refer to configs/datasets for more "
+                "dict or a list of dicts; refer to "
+                "https://datajuicer.github.io/data-juicer/en/main/docs/DatasetCfg.html for more "
                 "detailed examples",
             )
             parser.add_argument(
@@ -204,6 +261,14 @@ def init_configs(args: Optional[List[str]] = None, which_entry: object = None, l
                 default={},
                 help="Other optional arguments for exporting in dict. For example, the key mapping info for exporting "
                 "the WebDataset format.",
+            )
+            parser.add_argument(
+                "--export_aws_credentials",
+                type=Dict,
+                default=None,
+                help="Export-specific AWS credentials for S3 export. If export_path is S3 and this is not provided, "
+                "an error will be raised. Should contain aws_access_key_id, aws_secret_access_key, aws_region, "
+                "and optionally aws_session_token and endpoint_url.",
             )
             parser.add_argument(
                 "--keep_stats_in_res_ds",
@@ -459,7 +524,9 @@ def init_configs(args: Optional[List[str]] = None, which_entry: object = None, l
                 help="Whether to save all stats to only one file. Only used in " "Analysis.",
             )
             parser.add_argument("--ray_address", type=str, default="auto", help="The address of the Ray cluster.")
-
+            parser.add_argument(
+                "--custom-operator-paths", nargs="+", help="Paths to custom operator scripts or directories."
+            )
             parser.add_argument("--debug", action="store_true", help="Whether to run in debug mode.")
 
             # Filter out non-essential arguments for initial parsing
@@ -506,6 +573,12 @@ def init_configs(args: Optional[List[str]] = None, which_entry: object = None, l
             # Parse all arguments
             with timing_context("Parsing arguments"):
                 cfg = parser.parse_args(args=args)
+
+                if cfg.executor_type == "ray":
+                    os.environ[RAY_JOB_ENV_VAR] = "1"
+
+                if cfg.custom_operator_paths:
+                    load_custom_operators(cfg.custom_operator_paths)
 
                 # check the entry
                 from data_juicer.core.analyzer import Analyzer
@@ -569,12 +642,30 @@ def init_setup_from_cfg(cfg: Namespace, load_configs_only=False):
     :param cfg: an updated cfg
     """
 
-    cfg.export_path = os.path.abspath(cfg.export_path)
-    if cfg.work_dir is None:
-        cfg.work_dir = os.path.dirname(cfg.export_path)
+    # Handle S3 paths differently from local paths
+    if cfg.export_path.startswith("s3://"):
+        # For S3 paths, keep as-is (don't use os.path.abspath)
+        # If work_dir is not provided, use a default local directory for logs/checkpoints
+        if cfg.work_dir is None:
+            # Use a default local work directory for S3 exports
+            # This is where logs, checkpoints, and other local artifacts will be stored
+            cfg.work_dir = os.path.abspath("./outputs")
+            logger.info(f"Using default work_dir [{cfg.work_dir}] for S3 export_path [{cfg.export_path}]")
+    else:
+        # For local paths, convert to absolute path
+        cfg.export_path = os.path.abspath(cfg.export_path)
+        if cfg.work_dir is None:
+            cfg.work_dir = os.path.dirname(cfg.export_path)
+
     timestamp = time.strftime("%Y%m%d%H%M%S", time.localtime(time.time()))
     if not load_configs_only:
-        export_rel_path = os.path.relpath(cfg.export_path, start=cfg.work_dir)
+        # For S3 paths, use a simplified export path for log filename
+        if cfg.export_path.startswith("s3://"):
+            # Extract bucket and key from S3 path for log filename
+            s3_path_parts = cfg.export_path.replace("s3://", "").split("/", 1)
+            export_rel_path = s3_path_parts[1] if len(s3_path_parts) > 1 else s3_path_parts[0]
+        else:
+            export_rel_path = os.path.relpath(cfg.export_path, start=cfg.work_dir)
         log_dir = os.path.join(cfg.work_dir, "log")
         if not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
@@ -602,13 +693,10 @@ def init_setup_from_cfg(cfg: Namespace, load_configs_only=False):
         )
 
     # check number of processes np
-    sys_cpu_count = os.cpu_count()
-    if cfg.get("np", None) is None:
-        cfg.np = sys_cpu_count
-        logger.warning(
-            f"Number of processes `np` is not set, " f"set it to cpu count [{sys_cpu_count}] as default value."
-        )
-    if cfg.np > sys_cpu_count:
+    from data_juicer.utils.resource_utils import cpu_count
+
+    sys_cpu_count = cpu_count(cfg)
+    if cfg.get("np", None) and cfg.np > sys_cpu_count:
         logger.warning(
             f"Number of processes `np` is set as [{cfg.np}], which "
             f"is larger than the cpu count [{sys_cpu_count}]. Due "
@@ -677,21 +765,24 @@ def init_setup_from_cfg(cfg: Namespace, load_configs_only=False):
         text_key = cfg.text_keys[0]
     else:
         text_key = cfg.text_keys
+
+    SpecialTokens.image = cfg.get("image_special_token", SpecialTokens.image)
+    SpecialTokens.audio = cfg.get("audio_special_token", SpecialTokens.audio)
+    SpecialTokens.video = cfg.get("video_special_token", SpecialTokens.video)
+    SpecialTokens.eoc = cfg.get("eoc_special_token", SpecialTokens.eoc)
+
     op_attrs = {
         "text_key": text_key,
         "image_key": cfg.get("image_key", "images"),
         "audio_key": cfg.get("audio_key", "audios"),
         "video_key": cfg.get("video_key", "videos"),
         "image_bytes_key": cfg.get("image_bytes_key", "image_bytes"),
-        "num_proc": cfg.np,
         "turbo": cfg.get("turbo", False),
         "skip_op_error": cfg.get("skip_op_error", True),
         "work_dir": cfg.work_dir,
-        "image_special_token": cfg.get("image_special_token", SpecialTokens.image),
-        "audio_special_token": cfg.get("audio_special_token", SpecialTokens.audio),
-        "video_special_token": cfg.get("video_special_token", SpecialTokens.video),
-        "eoc_special_token": cfg.get("eoc_special_token", SpecialTokens.eoc),
     }
+    if not is_ray_mode():
+        op_attrs.update({"num_proc": cfg.get("np", None)})
     cfg.process = update_op_attr(cfg.process, op_attrs)
 
     return cfg
@@ -890,7 +981,10 @@ def namespace_to_arg_list(namespace, prefix="", includes=None, excludes=None):
                 continue
             if excludes is not None and concat_key in excludes:
                 continue
-            arg_list.append(f"--{concat_key}={value}")
+            if key == "process":
+                arg_list.append(f"--{concat_key}={json.dumps(value, ensure_ascii=False)}")
+            else:
+                arg_list.append(f"--{concat_key}={value}")
 
     return arg_list
 
@@ -1073,12 +1167,12 @@ def get_init_configs(cfg: Union[Namespace, Dict], load_configs_only: bool = True
 
 
 def get_default_cfg():
-    """Get default config values from config_all.yaml"""
+    """Get default config values from config_min.yaml"""
     cfg = Namespace()
 
-    # Get path to config_all.yaml
+    # Get path to config_min.yaml
     config_dir = os.path.dirname(os.path.abspath(__file__))
-    default_config_path = os.path.join(config_dir, "../../configs/config_min.yaml")
+    default_config_path = os.path.join(config_dir, "config_min.yaml")
 
     # Load default values from yaml
     with open(default_config_path, "r", encoding="utf-8") as f:

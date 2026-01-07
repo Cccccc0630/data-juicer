@@ -152,7 +152,7 @@ class VideoSplitByKeyFrameMapperTest(DataJuicerTestCaseBase):
             f'{SpecialTokens.video}{SpecialTokens.video}{SpecialTokens.video}{SpecialTokens.video}{SpecialTokens.video}{SpecialTokens.video} 两个长头发的女子正坐在一张圆桌前讲话互动。 {SpecialTokens.eoc}',
             'split_frames_num': [6]
         }]
-        op = VideoSplitByKeyFrameMapper()
+        op = VideoSplitByKeyFrameMapper(ffmpeg_extra_args='-movflags frag_keyframe+empty_moov')
         self._run_video_split_by_key_frame_mapper(op, ds_list, tgt_list)
 
     @TEST_TAG("standalone", "ray")

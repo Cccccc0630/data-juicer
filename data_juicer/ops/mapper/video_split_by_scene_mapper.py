@@ -26,10 +26,19 @@ def replace_func(match, scene_counts_iter):
 
 @OPERATORS.register_module(OP_NAME)
 class VideoSplitBySceneMapper(Mapper):
-    """Mapper to cut videos into scene clips."""
+    """Splits videos into scene clips based on detected scene changes.
+
+    This operator uses a specified scene detector to identify and split video scenes. It
+    supports three types of detectors: ContentDetector, ThresholdDetector, and
+    AdaptiveDetector. The operator processes each video in the sample, detects scenes, and
+    splits the video into individual clips. The minimum length of a scene can be set, and
+    progress can be shown during processing. The resulting clips are saved in the specified
+    directory or the same directory as the input files if no save directory is provided. The
+    operator also updates the text field in the sample to reflect the new video clips. If a
+    video does not contain any scenes, it remains unchanged."""
 
     # Define shared detector keys and their properties
-    avaliable_detectors = {
+    available_detectors = {
         "ContentDetector": ["weights", "luma_only", "kernel_size"],
         "AdaptiveDetector": [
             "window_width",
@@ -50,6 +59,7 @@ class VideoSplitBySceneMapper(Mapper):
         min_scene_len: NonNegativeInt = 15,
         show_progress: bool = False,
         save_dir: str = None,
+        ffmpeg_extra_args: str = "",
         *args,
         **kwargs,
     ):
@@ -64,6 +74,7 @@ class VideoSplitBySceneMapper(Mapper):
         :param save_dir: The directory where generated video files will be stored.
             If not specified, outputs will be saved in the same directory as their corresponding input files.
             This path can alternatively be defined by setting the `DJ_PRODUCED_DATA_DIR` environment variable.
+        :param ffmpeg_extra_args: Extra ffmpeg args for splitting video.
         :param args: extra args
         :param kwargs: extra args
         """
@@ -71,10 +82,10 @@ class VideoSplitBySceneMapper(Mapper):
         self._init_parameters = self.remove_extra_parameters(locals())
         self._init_parameters.pop("save_dir", None)
 
-        if detector not in self.avaliable_detectors:
+        if detector not in self.available_detectors:
             raise ValueError(
                 f"Scene detector {detector} is not supported. "
-                f"Can only be one of {list(self.avaliable_detectors.keys())}"
+                f"Can only be one of {list(self.available_detectors.keys())}"
             )
 
         self.detector = detector
@@ -82,11 +93,12 @@ class VideoSplitBySceneMapper(Mapper):
         self.min_scene_len = min_scene_len
         self.show_progress = show_progress
         self.save_dir = save_dir
+        self.ffmpeg_extra_args = ffmpeg_extra_args
 
         # prepare detector args
-        avaliable_kwargs = self.avaliable_detectors[self.detector]
+        available_kwargs = self.available_detectors[self.detector]
         self.detector_class = getattr(scenedetect.detectors, self.detector)
-        self.detector_kwargs = {key: kwargs[key] for key in avaliable_kwargs if key in kwargs}
+        self.detector_kwargs = {key: kwargs[key] for key in available_kwargs if key in kwargs}
 
     def process_single(self, sample, context=False):
         # there is no video in this sample
@@ -124,6 +136,7 @@ class VideoSplitBySceneMapper(Mapper):
                     scene_list=scene_list,
                     output_file_template=output_template,
                     show_progress=self.show_progress,
+                    arg_override=self.ffmpeg_extra_args,
                 )
             else:
                 output_video_keys[video_key] = [video_key]

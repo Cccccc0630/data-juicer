@@ -10,8 +10,16 @@ OP_NAME = "language_id_score_filter"
 
 @OPERATORS.register_module(OP_NAME)
 class LanguageIDScoreFilter(Filter):
-    """Filter to keep samples in a specific language with confidence score
-    larger than a specific min value."""
+    """Filter to keep samples in a specific language with a confidence score above a threshold.
+
+    This operator uses a FastText model to identify the language of each sample. It keeps
+    samples that are in the specified language(s) and have a language identification
+    confidence score greater than or equal to the minimum score. If no specific language is
+    provided, it only filters based on the confidence score. The language ID and its
+    confidence score are stored in the 'lang' and 'lang_score' fields of the sample's stats,
+    respectively."""
+
+    _batched_op = True
 
     def __init__(self, lang: Union[str, List[str]] = "", min_score: float = 0.8, *args, **kwargs):
         """
@@ -36,7 +44,7 @@ class LanguageIDScoreFilter(Filter):
         self.min_score = min_score
         self.model_key = prepare_model(model_type="fasttext")
 
-    def compute_stats_single(self, sample):
+    def compute_stats_single(self, sample, *args, **kwargs):
         # check if it's computed already
         if StatsKeys.lang in sample[Fields.stats] and StatsKeys.lang_score in sample[Fields.stats]:
             return sample
@@ -57,9 +65,8 @@ class LanguageIDScoreFilter(Filter):
 
     def process_single(self, sample):
         if self.lang:
-            return (
-                sample[Fields.stats][StatsKeys.lang] in self.lang
-                and sample[Fields.stats][StatsKeys.lang_score] >= self.min_score
+            return sample[Fields.stats][StatsKeys.lang] in self.lang and self.get_keep_boolean(
+                sample[Fields.stats][StatsKeys.lang_score], self.min_score
             )
         else:
-            return sample[Fields.stats][StatsKeys.lang_score] >= self.min_score
+            return self.get_keep_boolean(sample[Fields.stats][StatsKeys.lang_score], self.min_score)

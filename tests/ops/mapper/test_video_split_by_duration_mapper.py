@@ -196,7 +196,7 @@ class VideoSplitByDurationMapperTest(DataJuicerTestCaseBase):
             f'{SpecialTokens.video}{SpecialTokens.video} 白色的小羊站在一旁讲话。旁边还有两只灰色猫咪和一只拉着灰狼的猫咪。{SpecialTokens.eoc}{SpecialTokens.video}{SpecialTokens.video}{SpecialTokens.video}{SpecialTokens.video}{SpecialTokens.video} 两个长头发的女子正坐在一张圆桌前讲话互动。 {SpecialTokens.eoc}',
             'split_frames_num': [2, 5]
         }]
-        op = VideoSplitByDurationMapper(keep_original_sample=False)
+        op = VideoSplitByDurationMapper(keep_original_sample=False, ffmpeg_extra_args='-movflags frag_keyframe+empty_moov')
         self._run_video_split_by_duration_mapper(op, ds_list, tgt_list)
 
     def test_min_last_split_duration(self):

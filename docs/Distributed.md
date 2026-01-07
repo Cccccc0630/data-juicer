@@ -30,7 +30,7 @@ This default execution plan can be quite inefficient especially for scenarios wi
 Streaming reading of JSON files is a common requirement in data processing for foundation models, as many datasets are stored in JSONL format and in huge sizes. 
 However, the current implementation in Ray Datasets, which is rooted in the underlying Arrow library (up to Ray version 2.40 and Arrow version 18.1.0), does not support streaming reading of JSON files.
 
-To address the lack of native support for streaming JSON data, we have developed a streaming loading interface and contributed an in-house [patch](https://github.com/modelscope/data-juicer/pull/515) for Apache Arrow ([PR to the repo](https://github.com/apache/arrow/pull/45084)). This patch helps alleviate Out-of-Memory issues. With this patch, Data-Juicer in Ray mode will, by default, use the streaming loading interface to load JSON files. 
+To address the lack of native support for streaming JSON data, we have developed a streaming loading interface and contributed an in-house [patch](https://github.com/datajuicer/data-juicer/pull/515) for Apache Arrow ([PR to the repo](https://github.com/apache/arrow/pull/45084)). This patch helps alleviate Out-of-Memory issues. With this patch, Data-Juicer in Ray mode will, by default, use the streaming loading interface to load JSON files. 
 Besides, streaming-read support for CSV and Parquet files is already enabled.
 
 
@@ -60,8 +60,8 @@ We tested the MinHash-based RayDeduplicator on datasets sized at 200GB, 1TB, and
 Before starting, you should install Data-Juicer and its `dist` requirements:
 
 ```shell
-pip install -v -e .  # Install the minimal requirements of Data-Juicer
-pip install -v -e ".[dist]"  # Include dependencies on Ray and other distributed libraries
+uv pip install -v -e .  # Install the minimal requirements of Data-Juicer
+uv pip install -v -e ".[dist]"  # Include dependencies on Ray and other distributed libraries
 ```
 
 Then start a Ray cluster (ref to the [Ray doc](https://docs.ray.io/en/latest/ray-core/starting-ray.html) for more details):

@@ -28,8 +28,17 @@ OP_NAME = "image_captioning_mapper"
 @OPERATORS.register_module(OP_NAME)
 @LOADED_IMAGES.register_module(OP_NAME)
 class ImageCaptioningMapper(Mapper):
-    """Mapper to generate samples whose captions are generated based on
-    another model and the figure."""
+    """Generates image captions using a Hugging Face model and appends them to samples.
+
+    This operator generates captions for images in the input samples using a specified
+    Hugging Face model. It can generate multiple captions per image and apply different
+    strategies to retain the generated captions. The operator supports three retention
+    modes: 'random_any', 'similar_one_simhash', and 'all'. In 'random_any' mode, a random
+    caption is retained. In 'similar_one_simhash' mode, the most similar caption to the
+    original text (based on SimHash) is retained. In 'all' mode, all generated captions are
+    concatenated and retained. The operator can also keep or discard the original sample
+    based on the `keep_original_sample` parameter. If both `prompt` and `prompt_key` are
+    set, the `prompt_key` takes precedence."""
 
     _accelerator = "cuda"
     _batched_op = True
@@ -50,6 +59,7 @@ class ImageCaptioningMapper(Mapper):
         Initialization method.
 
         :param hf_img2seq: model name on huggingface to generate caption
+        :param trust_remote_code: whether to trust the remote code of HF models.
         :param caption_num: how many candidate captions to generate
             for each image
         :param keep_candidate_mode: retain strategy for the generated
@@ -86,7 +96,7 @@ class ImageCaptioningMapper(Mapper):
         :param args: extra args
         :param kwargs: extra args
         """
-        kwargs.setdefault("mem_required", "16GB")
+        kwargs["memory"] = "16GB" if kwargs.get("memory", 0) == 0 else kwargs["memory"]
 
         super().__init__(*args, **kwargs)
 
@@ -153,6 +163,7 @@ class ImageCaptioningMapper(Mapper):
         # and the original special tokens are kept in an order-preserving way.
 
         model, processor = get_model(self.model_key, rank, self.use_cuda())
+        model.config.image_token_index = 50265
 
         # do generation for each image chunk by chunk
         for chunk in ori_sample[self.text_key].split(SpecialTokens.eoc):

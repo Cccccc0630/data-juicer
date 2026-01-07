@@ -12,6 +12,7 @@ from data_juicer.utils.model_utils import (
     prepare_model,
     update_sampling_params,
 )
+from data_juicer.utils.ray_utils import is_ray_mode
 
 from ..base_op import OPERATORS, Mapper
 
@@ -25,18 +26,17 @@ OP_NAME = "generate_qa_from_examples_mapper"
 # TODO: Extend LLM-based OPs into API-based implementation.
 @OPERATORS.register_module(OP_NAME)
 class GenerateQAFromExamplesMapper(Mapper):
-    """
-    Mapper to generate question and answer pairs from examples.
-    You should configure an empty dataset in your yaml config file:
-    ```
-    generated_dataset_config:
-      type: 'EmptyFormatter'  # use `RayEmptyFormatter` when enable ray
-      length: ${The number of generated samples}
-      feature_keys: ${text key}
-    ```
-    The number of samples generated is determined by
-    the length of the empty dataset.
-    """
+    """Generates question and answer pairs from examples using a Hugging Face model.
+
+    This operator generates QA pairs based on provided seed examples. The number of
+    generated samples is determined by the length of the empty dataset configured in the
+    YAML file. The operator uses a Hugging Face model to generate new QA pairs, which are
+    then filtered based on their similarity to the seed examples. Samples with a similarity
+    score below the specified threshold are kept. The similarity is computed using the
+    ROUGE-L metric. The operator requires a seed file in chatml format, which provides the
+    initial QA examples. The generated QA pairs must follow specific formatting rules, such
+    as maintaining the same format as the input examples and ensuring that questions and
+    answers are paired correctly."""
 
     DEFAULT_SYSTEM_PROMPT = (
         "请你仔细观察多个示例数据的输入和输出，按照你的理解，总结出相应规矩，然后写出一个新的【问题】和【回答】。"
@@ -127,16 +127,9 @@ class GenerateQAFromExamplesMapper(Mapper):
         sampling_params = update_sampling_params(sampling_params, hf_model, self.enable_vllm)
 
         if enable_vllm:
-            assert torch.cuda.device_count() >= 1, "must be executed in CUDA"
-            # cannot initialize vllm replicas on different GPUs
-            self.num_proc = 1
-            if model_params.get("tensor_parallel_size") is None:
-                tensor_parallel_size = torch.cuda.device_count()
-                logger.info(
-                    f"Set tensor_parallel_size to \
-                    {tensor_parallel_size} for vllm."
-                )
-                model_params["tensor_parallel_size"] = tensor_parallel_size
+            if not is_ray_mode():
+                # cannot initialize vllm replicas on different GPUs
+                self.num_proc = 1
             self.model_key = prepare_model(model_type="vllm", pretrained_model_name_or_path=hf_model, **model_params)
             self.sampling_params = vllm.SamplingParams(**sampling_params)
         else:

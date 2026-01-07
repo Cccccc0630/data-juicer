@@ -98,12 +98,20 @@ def optimal_param(
 
 @OPERATORS.register_module(OP_NAME)
 class DocumentMinhashDeduplicator(Deduplicator):
-    """
-    Deduplicator to deduplicate samples at document-level using MinHashLSH.
+    """Deduplicates samples at the document level using MinHash LSH.
 
-    Different from simhash, minhash is stored as bytes, so they won't be
-    kept in the final dataset.
-    """
+    This operator computes MinHash values for each sample and uses Locality-Sensitive
+    Hashing (LSH) to identify and remove near-duplicate documents. The Jaccard similarity
+    threshold determines when two documents are considered duplicates. The tokenization
+    method can be customized, and a Hugging Face tokenizer can be used for 'sentencepiece'
+    tokenization. The minhash values are stored as bytes and are not kept in the final
+    dataset. The number of bands and rows per band in LSH can be set manually or determined
+    by an optimal parameter computation algorithm. Important notes:
+    - If using 'punctuation' tokenization with an ignore pattern, ensure the pattern does
+      not include punctuations.
+    - For 'sentencepiece' tokenization, a tokenizer model path is required.
+    - The deduplication process involves clustering and filtering, and only unique samples
+      or the first sample in a cluster are retained."""
 
     def __init__(
         self,
@@ -324,6 +332,96 @@ class DocumentMinhashDeduplicator(Deduplicator):
             _filter_minhash_dup_helper,
             with_indices=True,
         )
+        logger.info(f"Keep {len(dataset)} samples after MinHash dedup.")
+
+        return dataset, dup_pairs
+
+
+@OPERATORS.register_module(f"{OP_NAME}_with_uid")
+class DocumentMinhashDeduplicatorWithUid(DocumentMinhashDeduplicator):
+    """
+    A Deduplicator that performs document-level deduplication using MinHashLSH.
+
+    Unlike `DocumentMinhashDeduplicator`, this class requires the dataset to include an additional column named
+    '__dj__uid' of type int, with unique values for each sample. This column is essential for supporting
+    incremental deduplication scenarios.
+
+    For example, consider a scenario where you have an already deduplicated dataset A and a new dataset B that
+    you wish to add. If you want to perform joint deduplication on both A and B while prioritizing the retention of
+    data from A, you can ensure that all '__dj__uid' values in B are greater than those in A. Then, by applying
+    this deduplicator to the combined dataset, duplicates will be resolved in favor of the entries from A.
+    """
+
+    def process(self, dataset, show_num=0):
+        """
+        For doc-level, dataset --> dataset.
+
+        :param dataset: input dataset
+        :param show_num: number of traced samples used when tracer is
+            open.
+        :return: deduplicated dataset and the sampled duplicate pairs.
+        """
+        # no need to deduplicate because too few samples
+        if len(dataset) <= 1:
+            return dataset, {}
+
+        minhashes = dataset[HashKeys.minhash]
+        # remove bytes minhash column otherwise unexpected error would occur
+        # when exporting the processed dataset
+        dataset = dataset.remove_columns([HashKeys.minhash])
+        uids = dataset[HashKeys.uid]
+        uid2idx = {uid: idx for idx, uid in enumerate(uids)}
+
+        # make clusters -- construct the minhash lookup tables of seg to ids
+        logger.info(f"Start clustering for {len(dataset)} samples...")
+        batch_size = 10000
+        for i in tqdm(
+            range(0, len(minhashes), batch_size), dynamic_ncols=True, desc="Iterating MinHashes of samples..."
+        ):
+            batch = minhashes[i : i + batch_size]
+            batch_uid = uids[i : i + batch_size]
+            for uid, hs in zip(batch_uid, batch):
+                for h, hashtable in zip(hs, self.hash_tables):
+                    hashtable[h].add(uid)
+
+        # using UnionFind set to union samples within the same clusters
+        union_find = UnionFind()
+        for table in tqdm(self.hash_tables, dynamic_ncols=True, desc="Clustering"):
+            for cluster in table.values():
+                if len(cluster) <= 1:
+                    continue
+                uid = min(cluster)
+                for x in cluster:
+                    union_find.union(x, uid)
+        logger.info(
+            f"There are {len(set(union_find.parent.values()))} "
+            f"clusters that includes multiple near-duplicate samples."
+        )
+
+        # record the duplicate sample pairs
+        dup_pairs = {}
+        if show_num > 0:
+            for i in range(len(dataset)):
+                uid = uids[i]
+                cluster_uid = union_find.find(uid)
+                cluster_idx = uid2idx[cluster_uid]
+                if cluster_uid != uid and cluster_idx not in dup_pairs:
+                    dup_pairs[cluster_idx] = [
+                        dataset[cluster_idx],
+                        dataset[i],
+                    ]
+                if len(dup_pairs) >= show_num:
+                    break
+
+        # filtering -- only keep those samples whose parent index is itself,
+        # including:
+        # 1. samples that form a cluster by themselves
+        # 2. the first sample in a cluster that includes multiple samples
+        def _filter_minhash_dup_helper(sample):
+            uid = sample[HashKeys.uid]
+            return union_find.find(uid) == uid
+
+        dataset = dataset.filter(_filter_minhash_dup_helper)
         logger.info(f"Keep {len(dataset)} samples after MinHash dedup.")
 
         return dataset, dup_pairs

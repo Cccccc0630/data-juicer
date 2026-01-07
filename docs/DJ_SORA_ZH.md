@@ -22,12 +22,16 @@ DJ-SORA将基于Data-Juicer(包含上百个专用的视频、图像、音频、�
 
 ## 路线图
 ### 概览
-* [支持视频数据的高性能加载和处理](#支持视频数据的高性能加载和处理)
-* [基础算子（视频时空维度）](#基础算子视频时空维度)
-* [进阶算子（细粒度模态间匹配及生成）](#进阶算子细粒度模态间匹配及生成)
-* [进阶算子（视频内容）](#进阶算子视频内容)
-* [DJ-SORA数据菜谱及数据集](#DJ-SORA数据菜谱及数据集)
-* [DJ-SORA数据验证及模型训练](#DJ-SORA数据验证及模型训练)
+- [DJ-SORA](#dj-sora)
+  - [动机](#动机)
+  - [路线图](#路线图)
+    - [概览](#概览)
+    - [支持视频数据的高性能加载和处理](#支持视频数据的高性能加载和处理)
+    - [基础算子（视频时空维度）](#基础算子视频时空维度)
+    - [进阶算子（细粒度模态间匹配及生成）](#进阶算子细粒度模态间匹配及生成)
+    - [进阶算子（视频内容）](#进阶算子视频内容)
+    - [DJ-SORA数据菜谱及数据集](#dj-sora数据菜谱及数据集)
+    - [DJ-SORA数据验证及模型训练](#dj-sora数据验证及模型训练)
 
 ### 支持视频数据的高性能加载和处理
 - [✅] 并行化数据加载存储：
@@ -114,5 +118,5 @@ DJ-SORA将基于Data-Juicer(包含上百个专用的视频、图像、音频、�
     - ...
   - [✅] (Model-Data sandbox) 在相对小的模型和DJ-SORA数据集上，探索形成低开销、可迁移、有指导性的data-model co-design、配置及检查点
   - [ ] [WIP] 更大规模、更多场景使用DJ-SORA数据训练类SORA模型，提高模型性能
-    - [✅] Data-Juicer-T2V, [V-Bench Top1 model](https://huggingface.co/datajuicer/Data-Juicer-T2V-v2)。详情请参考[这里](./Sandbox-ZH.md)。
+    - [✅] Data-Juicer-T2V, [V-Bench Top1 model](https://huggingface.co/datajuicer/Data-Juicer-T2V-v2)。详情请参考[这里](https://datajuicer.github.io/data-juicer-sandbox/zh_CN/main/index_ZH.html)。
     - ...

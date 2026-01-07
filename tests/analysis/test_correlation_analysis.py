@@ -11,6 +11,8 @@ from data_juicer.utils.unittest_utils import DataJuicerTestCaseBase
 class CorrelationAnalysisTest(DataJuicerTestCaseBase):
 
     def setUp(self):
+        super().setUp()
+
         self.df = pd.DataFrame({
             'A': [1, 2, 3],
             'B': [[1, 2, 3], [4, 5], [6]],
@@ -29,6 +31,8 @@ class CorrelationAnalysisTest(DataJuicerTestCaseBase):
     def tearDown(self):
         if os.path.exists(self.temp_output_path):
             os.system(f'rm -rf {self.temp_output_path}')
+
+        super().tearDown()
 
     def test_is_numeric_list_series(self):
         res = {

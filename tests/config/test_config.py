@@ -1,4 +1,6 @@
 import os
+import sys
+import copy
 import unittest
 from contextlib import redirect_stdout, redirect_stderr
 from io import StringIO
@@ -7,7 +9,9 @@ from jsonargparse import Namespace, namespace_to_dict
 
 from data_juicer.config import init_configs, get_default_cfg, update_op_attr, export_config, merge_config, prepare_side_configs
 from data_juicer.ops import load_ops
-from data_juicer.utils.unittest_utils import DataJuicerTestCaseBase
+from data_juicer.utils.unittest_utils import DataJuicerTestCaseBase, TEST_TAG
+from data_juicer.utils.constant import RAY_JOB_ENV_VAR
+
 
 test_yaml_path = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                               'demo_4_test.yaml')
@@ -37,6 +41,8 @@ class ConfigTest(DataJuicerTestCaseBase):
         if os.path.exists(self.tmp_dir):
             os.system(f'rm -rf {self.tmp_dir}')
 
+        os.environ[RAY_JOB_ENV_VAR] = "0"
+
     def test_help_info(self):
         out = StringIO()
         with redirect_stdout(out), self.assertRaises(SystemExit):
@@ -65,22 +71,27 @@ class ConfigTest(DataJuicerTestCaseBase):
                         'image_bytes_key': 'image_bytes',
                         'audio_key': 'audios',
                         'video_key': 'videos',
+                        'system_key': 'system',
+                        'instruction_key': 'instruction',
+                        'prompt_key': 'prompt',
                         'query_key': 'query',
                         'response_key': 'response',
                         'history_key': 'history',
-                        'audio_special_token': '<__dj__audio>',
-                        'eoc_special_token': '<|__dj__eoc|>',
-                        'image_special_token': '<__dj__image>',
-                        'video_special_token': '<__dj__video>',
                         'accelerator': None,
                         'num_proc': 4,
-                        'cpu_required': 1,
-                        'mem_required': 0,
+                        'num_cpus': None,
+                        'memory': None,
+                        'num_gpus': None,
                         'turbo': False,
-                        'batch_size': 1000,
                         'index_key': None,
                         'skip_op_error': True,
                         'work_dir': WORKDIR,
+                        'cpu_required': None,
+                        'gpu_required': None,
+                        'mem_required': None,
+                        'ray_execution_mode': None,
+                        'runtime_env': None,
+
                     }
                 }, 'nested dict load fail, for nonparametric op')
             self.assertDictEqual(
@@ -93,23 +104,30 @@ class ConfigTest(DataJuicerTestCaseBase):
                         'image_bytes_key': 'image_bytes',
                         'audio_key': 'audios',
                         'video_key': 'videos',
+                        'system_key': 'system',
+                        'instruction_key': 'instruction',
+                        'prompt_key': 'prompt',
                         'query_key': 'query',
                         'response_key': 'response',
                         'history_key': 'history',
-                        'audio_special_token': '<__dj__audio>',
-                        'eoc_special_token': '<|__dj__eoc|>',
-                        'image_special_token': '<__dj__image>',
-                        'video_special_token': '<__dj__video>',
+                        'min_closed_interval': True,
+                        'max_closed_interval': True,
+                        'reversed_range': False,
                         'accelerator': None,
                         'num_proc': 4,
                         'stats_export_path': None,
-                        'cpu_required': 1,
-                        'mem_required': 0,
+                        'num_cpus': None,
+                        'memory': None,
                         'turbo': False,
-                        'batch_size': 1000,
+                        'num_gpus': None,
                         'index_key': None,
                         'skip_op_error': True,
                         'work_dir': WORKDIR,
+                        'cpu_required': None,
+                        'gpu_required': None,
+                        'mem_required': None,
+                        'ray_execution_mode': None,
+                        'runtime_env': None,
                     }
                 }, 'nested dict load fail, un-expected internal value')
 
@@ -169,25 +187,32 @@ class ConfigTest(DataJuicerTestCaseBase):
                         'text_key': 'text',
                         'image_key': 'images',
                         'image_bytes_key': 'image_bytes',
+                        'system_key': 'system',
+                        'instruction_key': 'instruction',
+                        'prompt_key': 'prompt',
                         'audio_key': 'audios',
                         'video_key': 'videos',
                         'query_key': 'query',
                         'response_key': 'response',
                         'history_key': 'history',
-                        'audio_special_token': '<__dj__audio>',
-                        'eoc_special_token': '<|__dj__eoc|>',
-                        'image_special_token': '<__dj__image>',
-                        'video_special_token': '<__dj__video>',
+                        'min_closed_interval': True,
+                        'max_closed_interval': True,
+                        'reversed_range': False,
                         'accelerator': None,
                         'num_proc': 4,
                         'stats_export_path': None,
-                        'cpu_required': 1,
-                        'mem_required': 0,
+                        'num_cpus': None,
+                        'memory': None,
+                        'num_gpus': None,
                         'turbo': False,
-                        'batch_size': 1000,
                         'index_key': None,
                         'skip_op_error': True,
                         'work_dir': WORKDIR,
+                        'cpu_required': None,
+                        'gpu_required': None,
+                        'mem_required': None,
+                        'ray_execution_mode': None,
+                        'runtime_env': None,
                     }
                 })
             self.assertDictEqual(
@@ -200,23 +225,30 @@ class ConfigTest(DataJuicerTestCaseBase):
                         'image_bytes_key': 'image_bytes',
                         'audio_key': 'audios',
                         'video_key': 'videos',
+                        'system_key': 'system',
+                        'instruction_key': 'instruction',
+                        'prompt_key': 'prompt',
                         'query_key': 'query',
                         'response_key': 'response',
                         'history_key': 'history',
-                        'audio_special_token': '<__dj__audio>',
-                        'eoc_special_token': '<|__dj__eoc|>',
-                        'image_special_token': '<__dj__image>',
-                        'video_special_token': '<__dj__video>',
+                        'min_closed_interval': True,
+                        'max_closed_interval': True,
+                        'reversed_range': False,
                         'accelerator': None,
                         'num_proc': 4,
                         'stats_export_path': None,
-                        'cpu_required': 1,
-                        'mem_required': 0,
+                        'num_cpus': None,
+                        'memory': None,
                         'turbo': False,
-                        'batch_size': 1000,
+                        'num_gpus': None,
                         'index_key': None,
                         'skip_op_error': True,
                         'work_dir': WORKDIR,
+                        'cpu_required': None,
+                        'gpu_required': None,
+                        'mem_required': None,
+                        'ray_execution_mode': None,
+                        'runtime_env': None,
                     }
                 })
             self.assertDictEqual(
@@ -229,23 +261,30 @@ class ConfigTest(DataJuicerTestCaseBase):
                         'image_bytes_key': 'image_bytes',
                         'audio_key': 'audios',
                         'video_key': 'videos',
+                        'system_key': 'system',
+                        'instruction_key': 'instruction',
+                        'prompt_key': 'prompt',
                         'query_key': 'query',
                         'response_key': 'response',
                         'history_key': 'history',
-                        'audio_special_token': '<__dj__audio>',
-                        'eoc_special_token': '<|__dj__eoc|>',
-                        'image_special_token': '<__dj__image>',
-                        'video_special_token': '<__dj__video>',
+                        'min_closed_interval': True,
+                        'max_closed_interval': True,
+                        'reversed_range': False,
                         'accelerator': None,
                         'num_proc': 4,
                         'stats_export_path': None,
-                        'cpu_required': 1,
-                        'mem_required': 0,
+                        'num_cpus': None,
+                        'memory': None,
                         'turbo': False,
-                        'batch_size': 1000,
+                        'num_gpus': None,
                         'index_key': None,
                         'skip_op_error': True,
                         'work_dir': WORKDIR,
+                        'cpu_required': None,
+                        'gpu_required': None,
+                        'mem_required': None,
+                        'ray_execution_mode': None,
+                        'runtime_env': None,
                     }
                 })
             self.assertDictEqual(
@@ -258,23 +297,30 @@ class ConfigTest(DataJuicerTestCaseBase):
                         'image_bytes_key': 'image_bytes',
                         'audio_key': 'audios',
                         'video_key': 'videos',
+                        'system_key': 'system',
+                        'instruction_key': 'instruction',
+                        'prompt_key': 'prompt',
                         'query_key': 'query',
                         'response_key': 'response',
                         'history_key': 'history',
-                        'audio_special_token': '<__dj__audio>',
-                        'eoc_special_token': '<|__dj__eoc|>',
-                        'image_special_token': '<__dj__image>',
-                        'video_special_token': '<__dj__video>',
+                        'min_closed_interval': True,
+                        'max_closed_interval': True,
+                        'reversed_range': False,
                         'accelerator': None,
                         'num_proc': 4,
                         'stats_export_path': None,
-                        'cpu_required': 1,
-                        'mem_required': 0,
+                        'num_cpus': None,
+                        'memory': None,
                         'turbo': False,
-                        'batch_size': 1000,
+                        'num_gpus': None,
                         'index_key': None,
                         'skip_op_error': True,
                         'work_dir': WORKDIR,
+                        'cpu_required': None,
+                        'gpu_required': None,
+                        'mem_required': None,
+                        'ray_execution_mode': None,
+                        'runtime_env': None,
                     }
                 })
             self.assertDictEqual(
@@ -287,23 +333,30 @@ class ConfigTest(DataJuicerTestCaseBase):
                         'image_bytes_key': 'image_bytes',
                         'audio_key': 'audios',
                         'video_key': 'videos',
+                        'system_key': 'system',
+                        'instruction_key': 'instruction',
+                        'prompt_key': 'prompt',
                         'query_key': 'query',
                         'response_key': 'response',
                         'history_key': 'history',
-                        'audio_special_token': '<__dj__audio>',
-                        'eoc_special_token': '<|__dj__eoc|>',
-                        'image_special_token': '<__dj__image>',
-                        'video_special_token': '<__dj__video>',
+                        'min_closed_interval': True,
+                        'max_closed_interval': True,
+                        'reversed_range': False,
                         'accelerator': None,
                         'num_proc': 4,
                         'stats_export_path': None,
-                        'cpu_required': 1,
-                        'mem_required': 0,
+                        'num_cpus': None,
+                        'memory': None,
                         'turbo': False,
-                        'batch_size': 1000,
+                        'num_gpus': None,
                         'index_key': None,
                         'skip_op_error': True,
                         'work_dir': WORKDIR,
+                        'cpu_required': None,
+                        'gpu_required': None,
+                        'mem_required': None,
+                        'ray_execution_mode': None,
+                        'runtime_env': None,
                     }
                 })
 
@@ -314,7 +367,7 @@ class ConfigTest(DataJuicerTestCaseBase):
 
         base_class_params = {
             'text_key', 'image_key', 'image_bytes_key', 'audio_key', 'video_key', 'query_key', 'response_key',
-            'history_key', 'accelerator', 'turbo', 'batch_size', 'num_proc', 'cpu_required', 'mem_required', 'work_dir',
+            'history_key', 'accelerator', 'turbo', 'batch_size', 'num_proc', 'num_cpus', 'memory', 'work_dir',
         }
 
         parser = ArgumentParser(default_env=True, default_config_files=None)
@@ -328,9 +381,8 @@ class ConfigTest(DataJuicerTestCaseBase):
                 base_param_key = f'{op_name}.{base_param}'
                 self.assertIn(base_param_key, params)
 
-
     def test_get_default_cfg(self):
-        """Test getting default configuration from config_all.yaml"""
+        """Test getting default configuration from config_min.yaml"""
         # Get default config
         cfg = get_default_cfg()
         
@@ -571,6 +623,115 @@ class ConfigTest(DataJuicerTestCaseBase):
 
             with self.assertRaises(TypeError):
                 prepare_side_configs('xxx.txt')
+
+    def test_cli_custom_operator_paths(self):
+        """Test arg custom_operator_paths"""
+
+        new_ops_dir = f'{WORKDIR}/custom_ops'
+        new_op_path1 = os.path.join(new_ops_dir, 'new_op1.py')
+        new_op_path2 = os.path.join(new_ops_dir, 'test_dir_module/new_op2.py')
+        os.makedirs(os.path.dirname(new_op_path1), exist_ok=True)
+        os.makedirs(os.path.dirname(new_op_path2), exist_ok=True)
+
+        with open(new_op_path1, 'w') as f:
+            f.write("""
+from data_juicer.ops.base_op import OPERATORS, Mapper
+                                              
+@OPERATORS.register_module('custom_mapper1')
+class CustomMapper1(Mapper):
+    def process_single(self, data):
+        return data
+""")
+        with open(new_op_path2, 'w') as f:
+            f.write("""
+from data_juicer.ops.base_op import OPERATORS, Mapper
+                                              
+@OPERATORS.register_module('custom_mapper2')
+class CustomMapper2(Mapper):
+    def process_single(self, data):
+        return data
+""")
+            
+        with open(os.path.join(os.path.dirname(new_op_path2), '__init__.py'), 'w') as f:
+            f.write("""
+from . import new_op2
+""")
+
+        init_configs(args=[
+            '--config', test_yaml_path,
+            '--custom-operator-paths', new_op_path1, os.path.dirname(new_op_path2)
+        ])
+        from data_juicer.ops.base_op import OPERATORS
+        self.assertIn('custom_mapper1', list(OPERATORS.modules.keys()))
+        self.assertIn('custom_mapper2', list(OPERATORS.modules.keys()))
+        
+        OPERATORS.modules.pop('custom_mapper1')
+        OPERATORS.modules.pop('custom_mapper2')
+
+    # TODO: TEST_TAG("ray ") and RayExecutor will repeatedly execute ray init, 
+    # resulting in the custom module not being found
+    # @TEST_TAG("ray")
+    @unittest.skip('affect other test cases')
+    def test_cli_custom_operator_paths_ray(self):
+        """Test arg custom_operator_paths"""
+
+        new_ops_dir = f'{WORKDIR}/custom_ops'
+        new_op_path1 = os.path.join(new_ops_dir, 'new_op3.py')
+        new_op_path2 = os.path.join(new_ops_dir, 'test_dir_module2/new_op4.py')
+        os.makedirs(os.path.dirname(new_op_path1), exist_ok=True)
+        os.makedirs(os.path.dirname(new_op_path2), exist_ok=True)
+        tmp_yaml_path = f'{WORKDIR}/demo_4_test_ray_tmp.yaml'
+        
+        with open(tmp_yaml_path, 'w') as f:
+            f.write("""
+project_name: 'test_demo'
+dataset_path: './demos/data/demo-dataset.jsonl'
+executor_type: ray
+ray_address: auto
+export_path: './outputs/demo/demo-processed.parquet'
+process:
+  - custom_mapper3:
+  - custom_mapper4:
+""")
+
+        with open(new_op_path1, 'w') as f:
+            f.write("""
+from data_juicer.ops.base_op import OPERATORS, Mapper
+                                              
+@OPERATORS.register_module('custom_mapper3')
+class CustomMapper3(Mapper):
+    def process_single(self, data):
+        data['text'] += 'tag1'
+        return data
+""")
+        with open(new_op_path2, 'w') as f:
+            f.write("""
+from data_juicer.ops.base_op import OPERATORS, Mapper
+                                              
+@OPERATORS.register_module('custom_mapper4')
+class CustomMapper4(Mapper):
+    def process_single(self, data):
+        data['text'] += 'tag2'
+        return data
+""")
+            
+        with open(os.path.join(os.path.dirname(new_op_path2), '__init__.py'), 'w') as f:
+            f.write("""
+from . import new_op4
+""")
+
+        cfg = init_configs(args=[
+            '--config', tmp_yaml_path,
+            '--custom-operator-paths', new_op_path1, os.path.dirname(new_op_path2)
+        ])
+        from data_juicer.core.executor.ray_executor import RayExecutor
+
+        executor = RayExecutor(cfg)
+        ds = executor.run()
+        for data in ds.to_list():
+            self.assertTrue(data['text'].endswith('tag1tag2'))
+
+        os.environ[RAY_JOB_ENV_VAR] = "0"
 
 
 if __name__ == '__main__':

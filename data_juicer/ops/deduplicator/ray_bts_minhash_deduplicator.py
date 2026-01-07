@@ -12,7 +12,7 @@ from typing_extensions import Annotated
 from data_juicer.utils.constant import HashKeys
 from data_juicer.utils.lazy_loader import LazyLoader
 from data_juicer.utils.model_utils import prepare_sentencepiece_model
-from data_juicer.utils.resource_utils import get_ray_gpu_count, get_ray_gpu_memory
+from data_juicer.utils.ray_utils import ray_available_gpu_memories, ray_gpu_count
 
 from ..base_op import OPERATORS, Deduplicator
 from ..common.helper_func import split_on_whitespace
@@ -286,9 +286,17 @@ class GPUMinHashActor:
 
 @OPERATORS.register_module(OP_NAME)
 class RayBTSMinhashDeduplicator(Deduplicator):
-    """
-    A MinhashLSH deduplicator based on RAY.
-    """
+    """A MinhashLSH deduplicator that operates in Ray distributed mode.
+
+    This operator uses the MinHash LSH technique to identify and remove near-duplicate
+    samples from a dataset. It supports various tokenization methods, including space,
+    punctuation, character, and sentencepiece. The Jaccard similarity threshold is used to
+    determine if two samples are considered duplicates. If the Jaccard similarity of two
+    samples is greater than or equal to the specified threshold, one of the samples is
+    filtered out. The operator computes the MinHash values for each sample and uses a union-
+    find algorithm to group similar samples. The key metric, Jaccard similarity, is computed
+    based on the shingling of the text. The operator can run on both CPU and GPU, with
+    specific batch size and memory configurations for each."""
 
     # TODO: Set a more reasonable value
     EMPTY_HASH_VALUE = "EMPTY"
@@ -312,7 +320,7 @@ class RayBTSMinhashDeduplicator(Deduplicator):
         max_pending_filter_tasks: Optional[int] = 20,
         num_filter_task_returns: Optional[int] = 10,
         merge_batch_size: Optional[int] = 1000,
-        minhash_batch_size: Optional[int] = "auto",
+        minhash_batch_size: Optional[Union[int, str]] = "auto",
         memory_per_sample: Optional[float] = 0.1,  # MB per sample
         *args,
         **kwargs,
@@ -473,22 +481,41 @@ class RayBTSMinhashDeduplicator(Deduplicator):
             dtype=np.uint64,
         ).T
 
-        if union_find_parallel_num == "auto":
-            union_find_parallel_num = int(ray.cluster_resources().get("CPU") / 2)
-        else:
-            union_find_parallel_num = int(union_find_parallel_num)
+        # Store config for lazy initialization - don't create actors yet
+        self._union_find_parallel_num_config = union_find_parallel_num
+        self._merge_batch_size_config = merge_batch_size
 
         self.max_pending_edge_buffer_task = max_pending_edge_buffer_task
         self.num_edge_buffer_task_returns = num_edge_buffer_task_returns
         self.max_pending_filter_tasks = max_pending_filter_tasks
         self.num_filter_task_returns = num_filter_task_returns
-        self.merge_batch_size = min(merge_batch_size, union_find_parallel_num)
-
-        logger.info(f"union_find_parallel_num = {union_find_parallel_num}")
-        self.union_find_parallel_num = union_find_parallel_num
         self.union_threshold = union_threshold
 
-        # Get remote classes only when needed
+        # Lazy initialization - actors created in _ensure_actors()
+        self._actors_initialized = False
+        self.union_find_parallel_num = None
+        self.merge_batch_size = None
+        self.remote_edge_buffers = None
+        self.union_find_list = None
+        self.empty_hash_value = None
+        self.empty_hash_table_id = None
+
+    def _ensure_actors(self):
+        """Create actors lazily on first use, when cluster has autoscaled."""
+        if self._actors_initialized:
+            return
+
+        # Calculate union_find_parallel_num NOW when cluster has scaled
+        if self._union_find_parallel_num_config == "auto":
+            self.union_find_parallel_num = max(1, int(ray.cluster_resources().get("CPU", 1) / 2))
+        else:
+            self.union_find_parallel_num = int(self._union_find_parallel_num_config)
+
+        self.merge_batch_size = min(self._merge_batch_size_config, self.union_find_parallel_num)
+
+        logger.info(f"union_find_parallel_num = {self.union_find_parallel_num}")
+
+        # Create actors NOW when cluster has resources
         remote_classes = get_remote_classes()
         self.remote_edge_buffers = [remote_classes["EdgeBuffer"].remote() for _ in range(self.union_find_parallel_num)]
         self.union_find_list = [
@@ -506,6 +533,8 @@ class RayBTSMinhashDeduplicator(Deduplicator):
         empty_hash_value = np.full((self.num_rows_per_band,), MAX_HASH, dtype=np.uint32)
         self.empty_hash_value = b"\x00\x00\x00\x00" + empty_hash_value.tobytes()
         self.empty_hash_table_id = int(MAX_HASH % self.union_find_parallel_num)
+
+        self._actors_initialized = True
 
     def band_minhash(self, minhash_list, uid_list):
         """
@@ -605,6 +634,9 @@ class RayBTSMinhashDeduplicator(Deduplicator):
 
     def run(self, dataset, **kwargs):
         # Ignore additional parameters like exporter, tracer, etc.
+        # Initialize actors lazily - now cluster has had time to autoscale
+        self._ensure_actors()
+
         start_time = time.time()
         # Get remote IdGenerator only when needed
         remote_classes = get_remote_classes()
@@ -631,7 +663,7 @@ class RayBTSMinhashDeduplicator(Deduplicator):
         if self.use_cuda():
             logger.info("Using GPU for MinHash computation")
             # Get available GPU count and set concurrency
-            gpu_count = get_ray_gpu_count()
+            gpu_count = ray_gpu_count()
             if gpu_count == 0:
                 logger.error("No GPUs available in Ray cluster")
                 raise RuntimeError("No GPUs available in Ray cluster")
@@ -640,9 +672,9 @@ class RayBTSMinhashDeduplicator(Deduplicator):
             logger.info(f"Setting GPU concurrency to {concurrency} based on available GPUs")
 
             # Get available GPU memory and set batch size
-            gpu_memory = get_ray_gpu_memory()
-            if gpu_memory:
-                min_memory = min(gpu_memory.values())
+            gpu_memory = ray_available_gpu_memories()
+            if len(gpu_memory):
+                min_memory = min(gpu_memory)
                 # Use 80% of available memory to leave room for overhead
                 safe_memory = min_memory * 0.8
                 estimated_batch_size = int(safe_memory / self.memory_per_sample)
@@ -666,7 +698,7 @@ class RayBTSMinhashDeduplicator(Deduplicator):
                 batch_format="pyarrow",
                 zero_copy_batch=True,
                 num_gpus=1,
-                concurrency=concurrency,
+                concurrency=ray.data.ActorPoolStrategy(size=concurrency),
                 batch_size=batch_size,
             )
             dataset.map_batches(
@@ -697,4 +729,58 @@ class RayBTSMinhashDeduplicator(Deduplicator):
         )
         end_time = time.time()
         logger.info(f"filter time = {end_time - start_time}")
+        return result
+
+
+@OPERATORS.register_module(f"{OP_NAME}_with_uid")
+class RayBTSMinhashDeduplicatorWithUid(RayBTSMinhashDeduplicator):
+    """
+    A MinhashLSH deduplicator based on RAY.
+
+    Unlike `RayBTSMinhashDeduplicator`, this class requires the input dataset to contain an additional column
+    named '__dj__uid' of type int, where each value is unique across samples. This column serves two main purposes:
+
+    1. **Reduced I/O Overhead**: Compared to RayBTSMinhashDeduplicator, this class does not persist intermediate
+    results, thereby reducing disk read and write operations.
+
+    2. **Support for Incremental Deduplication**: The '__dj__uid' column enables the deduplicator to perform
+    incremental deduplication. This is particularly useful in scenarios where you already have a deduplicated dataset
+    (e.g., dataset A) and want to add a new dataset (e.g., dataset B) while ensuring that duplicates are resolved
+    in favor of the original data.
+
+        For example, consider a scenario where you have an already deduplicated dataset A and a new dataset B that
+        you wish to add. If you want to perform joint deduplication on both A and B while prioritizing the retention
+        of data from A, you can ensure that all '__dj__uid' values in B are greater than those in A. Then, by applying
+        this deduplicator to the combined dataset, duplicates will be resolved in favor of the entries from A.
+    """
+
+    def run(self, dataset, **kwargs):
+        # Ignore additional parameters like exporter, tracer, etc.
+        # Initialize actors lazily - now cluster has had time to autoscale
+        self._ensure_actors()
+
+        start_time = time.time()
+
+        def minhash_with_uid(table: pa.Table) -> pa.Table:
+            uid_list = table[HashKeys.uid].to_pylist()
+            self.calc_minhash(table[self.text_key], uid_list)
+            return table
+
+        dataset.map_batches(
+            minhash_with_uid,
+            batch_format="pyarrow",
+            zero_copy_batch=True,
+        ).materialize()
+        end_time = time.time()
+        logger.info(f"MinHash time = {end_time - start_time}")
+
+        start_time = time.time()
+        self.merge()
+        end_time = time.time()
+        logger.info(f"merge time = {end_time - start_time}")
+        result = dataset.map_batches(
+            self.filter_with_union_find,
+            batch_format="pyarrow",
+            zero_copy_batch=True,
+        )
         return result

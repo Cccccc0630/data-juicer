@@ -12,6 +12,9 @@ from .clean_email_mapper import CleanEmailMapper
 from .clean_html_mapper import CleanHtmlMapper
 from .clean_ip_mapper import CleanIpMapper
 from .clean_links_mapper import CleanLinksMapper
+from .detect_character_attributes_mapper import DetectCharacterAttributesMapper
+from .detect_character_locations_mapper import DetectCharacterLocationsMapper
+from .detect_main_character_mapper import DetectMainCharacterMapper
 from .dialog_intent_detection_mapper import DialogIntentDetectionMapper
 from .dialog_sentiment_detection_mapper import DialogSentimentDetectionMapper
 from .dialog_sentiment_intensity_mapper import DialogSentimentIntensityMapper
@@ -31,11 +34,15 @@ from .generate_qa_from_text_mapper import GenerateQAFromTextMapper
 from .image_blur_mapper import ImageBlurMapper
 from .image_captioning_from_gpt4v_mapper import ImageCaptioningFromGPT4VMapper
 from .image_captioning_mapper import ImageCaptioningMapper
+from .image_detection_yolo_mapper import ImageDetectionYoloMapper
 from .image_diffusion_mapper import ImageDiffusionMapper
 from .image_face_blur_mapper import ImageFaceBlurMapper
+from .image_mmpose_mapper import ImageMMPoseMapper
 from .image_remove_background_mapper import ImageRemoveBackgroundMapper
+from .image_sam_3d_body_mapper import ImageSAM3DBodyMapper
 from .image_segment_mapper import ImageSegmentMapper
 from .image_tagging_mapper import ImageTaggingMapper
+from .image_tagging_vlm_mapper import ImageTaggingVLMMapper
 from .imgdiff_difference_area_generator_mapper import Difference_Area_Generator_Mapper
 from .imgdiff_difference_caption_generator_mapper import (
     Difference_Caption_Generator_Mapper,
@@ -43,6 +50,7 @@ from .imgdiff_difference_caption_generator_mapper import (
 from .mllm_mapper import MllmMapper
 from .nlpaug_en_mapper import NlpaugEnMapper
 from .nlpcda_zh_mapper import NlpcdaZhMapper
+from .optimize_prompt_mapper import OptimizePromptMapper
 from .optimize_qa_mapper import OptimizeQAMapper
 from .optimize_query_mapper import OptimizeQueryMapper
 from .optimize_response_mapper import OptimizeResponseMapper
@@ -70,13 +78,19 @@ from .sdxl_prompt2prompt_mapper import SDXLPrompt2PromptMapper
 from .sentence_augmentation_mapper import SentenceAugmentationMapper
 from .sentence_split_mapper import SentenceSplitMapper
 from .text_chunk_mapper import TextChunkMapper
+from .text_tagging_by_prompt_mapper import TextTaggingByPromptMapper
+from .vggt_mapper import VggtMapper
 from .video_captioning_from_audio_mapper import VideoCaptioningFromAudioMapper
 from .video_captioning_from_frames_mapper import VideoCaptioningFromFramesMapper
 from .video_captioning_from_summarizer_mapper import VideoCaptioningFromSummarizerMapper
 from .video_captioning_from_video_mapper import VideoCaptioningFromVideoMapper
+from .video_captioning_from_vlm_mapper import VideoCaptioningFromVLMMapper
+from .video_depth_estimation_mapper import VideoDepthEstimationMapper
 from .video_extract_frames_mapper import VideoExtractFramesMapper
 from .video_face_blur_mapper import VideoFaceBlurMapper
 from .video_ffmpeg_wrapped_mapper import VideoFFmpegWrappedMapper
+from .video_hand_reconstruction_mapper import VideoHandReconstructionMapper
+from .video_object_segmenting_mapper import VideoObjectSegmentingMapper
 from .video_remove_watermark_mapper import VideoRemoveWatermarkMapper
 from .video_resize_aspect_ratio_mapper import VideoResizeAspectRatioMapper
 from .video_resize_resolution_mapper import VideoResizeResolutionMapper
@@ -85,6 +99,7 @@ from .video_split_by_key_frame_mapper import VideoSplitByKeyFrameMapper
 from .video_split_by_scene_mapper import VideoSplitBySceneMapper
 from .video_tagging_from_audio_mapper import VideoTaggingFromAudioMapper
 from .video_tagging_from_frames_mapper import VideoTaggingFromFramesMapper
+from .video_whole_body_pose_estimation_mapper import VideoWholeBodyPoseEstimationMapper
 from .whitespace_normalization_mapper import WhitespaceNormalizationMapper
 
 __all__ = [
@@ -99,6 +114,9 @@ __all__ = [
     "CleanHtmlMapper",
     "CleanIpMapper",
     "CleanLinksMapper",
+    "DetectCharacterAttributesMapper",
+    "DetectCharacterLocationsMapper",
+    "DetectMainCharacterMapper",
     "DialogIntentDetectionMapper",
     "DialogSentimentDetectionMapper",
     "DialogSentimentIntensityMapper",
@@ -121,14 +139,19 @@ __all__ = [
     "ImageBlurMapper",
     "ImageCaptioningFromGPT4VMapper",
     "ImageCaptioningMapper",
+    "ImageDetectionYoloMapper",
     "ImageDiffusionMapper",
+    "ImageMMPoseMapper",
     "ImageFaceBlurMapper",
     "ImageRemoveBackgroundMapper",
+    "ImageSAM3DBodyMapper",
     "ImageSegmentMapper",
     "ImageTaggingMapper",
+    "ImageTaggingVLMMapper",
     "MllmMapper",
     "NlpaugEnMapper",
     "NlpcdaZhMapper",
+    "OptimizePromptMapper",
     "OptimizeQAMapper",
     "OptimizeQueryMapper",
     "OptimizeResponseMapper",
@@ -154,13 +177,19 @@ __all__ = [
     "SentenceAugmentationMapper",
     "SentenceSplitMapper",
     "TextChunkMapper",
+    "TextTaggingByPromptMapper",
+    "VggtMapper",
     "VideoCaptioningFromAudioMapper",
     "VideoCaptioningFromFramesMapper",
     "VideoCaptioningFromSummarizerMapper",
     "VideoCaptioningFromVideoMapper",
+    "VideoCaptioningFromVLMMapper",
+    "VideoDepthEstimationMapper",
     "VideoExtractFramesMapper",
     "VideoFFmpegWrappedMapper",
+    "VideoHandReconstructionMapper",
     "VideoFaceBlurMapper",
+    "VideoObjectSegmentingMapper",
     "VideoRemoveWatermarkMapper",
     "VideoResizeAspectRatioMapper",
     "VideoResizeResolutionMapper",
@@ -169,5 +198,6 @@ __all__ = [
     "VideoSplitBySceneMapper",
     "VideoTaggingFromAudioMapper",
     "VideoTaggingFromFramesMapper",
+    "VideoWholeBodyPoseEstimationMapper",
     "WhitespaceNormalizationMapper",
 ]

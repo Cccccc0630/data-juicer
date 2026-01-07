@@ -4,7 +4,7 @@ import io
 import os
 import re
 import shutil
-from typing import List, Optional, Tuple, Union
+from typing import ClassVar, Dict, List, Optional, Tuple, Union
 
 import av
 import numpy as np
@@ -13,7 +13,7 @@ from datasets import Audio, Image
 from loguru import logger
 from pydantic import PositiveInt
 
-from data_juicer.utils.constant import DEFAULT_PREFIX, Fields
+from data_juicer.utils.constant import DEFAULT_PREFIX, SPECIAL_TOKEN_ENV_PREFIX, Fields
 from data_juicer.utils.file_utils import add_suffix_to_filename
 from data_juicer.utils.lazy_loader import LazyLoader
 
@@ -23,16 +23,53 @@ cv2 = LazyLoader("cv2", "opencv-python")
 av.logging.set_level(av.logging.PANIC)
 
 
+_DEFAULT_TOKEN_FORMATS: Dict[str, str] = {
+    "image": f"<{DEFAULT_PREFIX}image>",
+    "audio": f"<{DEFAULT_PREFIX}audio>",
+    "video": f"<{DEFAULT_PREFIX}video>",
+    # others
+    "eoc": f"<|{DEFAULT_PREFIX}eoc|>",
+}
+
+
+class _MetaSpecialTokens(type):
+    def __new__(cls, name: str, bases: tuple, dct: dict):
+
+        for token_name in list(_DEFAULT_TOKEN_FORMATS.keys()):
+            env_var = f"{SPECIAL_TOKEN_ENV_PREFIX}{token_name.upper()}"
+            if env_var in os.environ:
+                dct[token_name] = os.environ[env_var]
+            else:
+                dct[token_name] = _DEFAULT_TOKEN_FORMATS[token_name]
+
+        return super().__new__(cls, name, bases, dct)
+
+    def __setattr__(cls, name: str, value: str) -> None:
+        if name in list(_DEFAULT_TOKEN_FORMATS.keys()):
+            env_var = f"{SPECIAL_TOKEN_ENV_PREFIX}{name.upper()}"
+            os.environ[env_var] = value
+            super().__setattr__(name, value)
+        elif name.startswith("__") and name.endswith("__"):
+            super().__setattr__(name, value)
+        else:
+            raise ValueError(
+                f"{name} is not a valid special token name, "
+                f"it should be one of {list(_DEFAULT_TOKEN_FORMATS.keys())}"
+            )
+
+
 # A class to keep special tokens for multimodal information in the texts
 # The tokens in this class can be updated by corresponding arguments in config
-class SpecialTokens(object):
+class SpecialTokens(metaclass=_MetaSpecialTokens):
+    """Special tokens for multimodal inputs, configurable via environment variables."""
+
     # modality
-    image = f"<{DEFAULT_PREFIX}image>"
-    audio = f"<{DEFAULT_PREFIX}audio>"
-    video = f"<{DEFAULT_PREFIX}video>"
+    image: ClassVar[str]
+    audio: ClassVar[str]
+    video: ClassVar[str]
 
     # others
-    eoc = f"<|{DEFAULT_PREFIX}eoc|>"
+    eoc: ClassVar[str]
 
 
 AV_STREAM_THREAD_TYPE = "AUTO"
@@ -362,6 +399,7 @@ def cut_video_by_seconds(
     output_video: str,
     start_seconds: float,
     end_seconds: Optional[float] = None,
+    video_stream_index: int = 0,
 ):
     """
     Cut a video into several segments by times in second.
@@ -371,6 +409,8 @@ def cut_video_by_seconds(
     :param start_seconds: the start time in second.
     :param end_seconds: the end time in second. If it's None, this function
         will cut the video from the start_seconds to the end of the video.
+    :param video_stream_index: the video stream index to decode,
+        default set to 0.
     :return: a boolean flag indicating whether the video was successfully
         cut or not.
     """
@@ -388,7 +428,7 @@ def cut_video_by_seconds(
         output_container = av.open(output_buffer, mode="w", format="mp4")
 
     # add the video stream into the output video according to input video
-    input_video_stream = container.streams.video[0]
+    input_video_stream = container.streams.video[video_stream_index]
     codec_name = input_video_stream.codec_context.name
     fps = input_video_stream.base_rate
     output_video_stream = output_container.add_stream(codec_name, rate=fps)
@@ -405,7 +445,6 @@ def cut_video_by_seconds(
 
     # seek to the start time, time must be in microsecond if no
     # stream is specified
-    container.seek(int(start_seconds * 1000000), any_frame=False, backward=True)
 
     # copy the video and audio streams until the end time
     # NOTICE: for different streams, the time have to be converted to be
@@ -414,6 +453,14 @@ def cut_video_by_seconds(
     # compute the start/end pts for video/audio streams
     video_start_pts = int(start_seconds / input_video_stream.time_base)
     video_end_pts = end_seconds / input_video_stream.time_base if end_seconds else input_video_stream.duration
+
+    container.seek(
+        video_start_pts,
+        stream=input_video_stream,
+        any_frame=False,  # only seek to the nearest keyframe
+        backward=True,  # select the nearest keyframe if no exact position is found
+    )
+
     if input_audio_stream is not None:
         audio_start_pts = int(start_seconds / input_audio_stream.time_base)
         audio_end_pts = end_seconds / input_audio_stream.time_base if end_seconds else input_audio_stream.duration
@@ -560,12 +607,14 @@ def extract_key_frames_by_seconds(input_video: Union[str, av.container.InputCont
     return all_key_frames
 
 
-def extract_key_frames(input_video: Union[str, av.container.InputContainer]):
+def extract_key_frames(input_video: Union[str, av.container.InputContainer], video_stream_index: int = 0):
     """
     Extract key frames from the input video. If there is no keyframes in the
     video, return the first frame.
 
     :param input_video: input video path or container.
+    :param video_stream_index: the video stream index to decode,
+        default set to 0.
     :return: a list of key frames.
     """
     # load the input video
@@ -581,7 +630,7 @@ def extract_key_frames(input_video: Union[str, av.container.InputContainer]):
         )
 
     key_frames = []
-    input_video_stream = container.streams.video[0]
+    input_video_stream = container.streams.video[video_stream_index]
     ori_skip_method = input_video_stream.codec_context.skip_frame
     input_video_stream.codec_context.skip_frame = "NONKEY"
     # restore to the beginning of the video

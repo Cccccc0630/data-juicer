@@ -25,9 +25,17 @@ OP_NAME = "image_diffusion_mapper"
 @OPERATORS.register_module(OP_NAME)
 @LOADED_IMAGES.register_module(OP_NAME)
 class ImageDiffusionMapper(Mapper):
-    """
-    Generate image by diffusion model
-    """
+    """Generate images using a diffusion model based on provided captions.
+
+    This operator uses a Hugging Face diffusion model to generate images from given
+    captions. It supports different modes for retaining generated samples, including random
+    selection, similarity-based selection, and retaining all. The operator can also generate
+    captions if none are provided, using a Hugging Face image-to-sequence model. The
+    strength parameter controls the extent of transformation from the reference image, and
+    the guidance scale influences how closely the generated images match the text prompt.
+    Generated images can be saved in a specified directory or the same directory as the
+    input files. This is a batched operation, processing multiple samples at once and
+    producing a specified number of augmented images per sample."""
 
     _accelerator = "cuda"
     _batched_op = True
@@ -53,6 +61,7 @@ class ImageDiffusionMapper(Mapper):
 
         :param hf_diffusion: diffusion model name on huggingface to generate
             the image.
+        :param trust_remote_code: whether to trust the remote code of HF models.
         :param torch_dtype: the floating point type used to load the diffusion
             model. Can be one of ['fp32', 'fp16', 'bf16']
         :param revision: The specific model version to use. It can be a
@@ -71,26 +80,10 @@ class ImageDiffusionMapper(Mapper):
             guidance_scale > 1.
         :param aug_num: The image number to be produced by stable-diffusion
             model.
-        :param keep_candidate_mode: retain strategy for the generated
-            $caption_num$ candidates.
-
-            'random_any': Retain the random one from generated captions
-
-            'similar_one_simhash': Retain the generated one that is most
-                similar to the original caption
-
-            'all': Retain all generated captions by concatenation
-
-        Note:
-            This is a batched_OP, whose input and output type are
-            both list. Suppose there are $N$ list of input samples, whose batch
-            size is $b$, and denote caption_num as $M$.
-            The number of total samples after generation is $2Nb$ when
-            keep_original_sample is True and $Nb$ when keep_original_sample is
-            False. For 'random_any' and 'similar_one_simhash' mode,
-            it's $(1+M)Nb$ for 'all' mode when keep_original_sample is True
-            and $MNb$ when keep_original_sample is False.
-
+        :param keep_original_sample: whether to keep the original sample. If
+            it's set to False, there will be only generated captions in the
+            final datasets and the original captions will be removed. It's True
+            by default.
         :param caption_key: the key name of fields in samples to store captions
             for each images. It can be a string if there is only one image in
             each sample. Otherwise, it should be a list. If it's none,
@@ -101,7 +94,7 @@ class ImageDiffusionMapper(Mapper):
             If not specified, outputs will be saved in the same directory as their corresponding input files.
             This path can alternatively be defined by setting the `DJ_PRODUCED_DATA_DIR` environment variable.
         """
-        kwargs.setdefault("mem_required", "8GB")
+        kwargs["memory"] = "8GB" if kwargs.get("memory", 0) == 0 else kwargs["memory"]
         super().__init__(*args, **kwargs)
         self._init_parameters = self.remove_extra_parameters(locals())
         self._init_parameters.pop("save_dir", None)

@@ -25,9 +25,16 @@ OP_NAME = "video_aesthetics_filter"
 @LOADED_VIDEOS.register_module(OP_NAME)
 @INTER_SAMPLED_FRAMES.register_module(OP_NAME)
 class VideoAestheticsFilter(Filter):
-    """Filter to keep data samples with aesthetics scores for specified frames
-    in the videos within a specific range.
-    """
+    """Filter to keep data samples with aesthetics scores for specified frames in the videos
+    within a specific range.
+
+    This operator evaluates the aesthetic quality of video frames using a Hugging Face
+    model. It keeps samples where the aesthetics scores of the specified frames fall within
+    a given range. The key metric, 'video_frames_aesthetics_score', is computed by
+    averaging, taking the max, or min of the frame scores, depending on the reduce mode.
+    Frame sampling can be done uniformly or by extracting all keyframes. The filter applies
+    a 'any' or 'all' strategy to decide if a sample should be kept based on the scores of
+    multiple videos."""
 
     _accelerator = "cuda"
 
@@ -51,6 +58,7 @@ class VideoAestheticsFilter(Filter):
             predictor. By default, we will use
             'shunk031/aesthetics-predictor-v2-sac-logos-ava1-l14-linearMSE',
             refer to pypi.org/project/simple-aesthetics-predictor
+        :param trust_remote_code: whether to trust the remote code of HF models.
         :param min_score: Min score for the predicted aesthetics in a video.
         :param max_score: Max score for the predicted aesthetics in a video.
         :param frame_sampling_method: sampling method of extracting frame
@@ -79,7 +87,7 @@ class VideoAestheticsFilter(Filter):
         :param args: Extra positional arguments.
         :param kwargs: Extra keyword arguments.
         """
-        kwargs.setdefault("mem_required", "1500MB")
+        kwargs["memory"] = "1500MB" if kwargs.get("memory", 0) == 0 else kwargs["memory"]
         super().__init__(*args, **kwargs)
         if hf_scorer_model == "":
             hf_scorer_model = "shunk031/aesthetics-predictor-v2-sac-logos-ava1-l14-linearMSE"
@@ -116,11 +124,81 @@ class VideoAestheticsFilter(Filter):
             "" if frame_sampling_method == "all_keyframes" else f"-{frame_num}"
         )
 
+    def compute_stats_single_actor(self, sample, model, processor, rank=None, context=False):
+        """
+        Compute aesthetics scores for a single sample in the actor.
+        With the model and processor loaded when the actor was created.
+        """
+        # check if it's computed already
+        if StatsKeys.video_frames_aesthetics_score in sample[Fields.stats]:
+            return sample
+        # there is no video in this sample
+        if self.video_key not in sample or not sample[self.video_key]:
+            sample[Fields.stats][StatsKeys.video_frames_aesthetics_score] = np.array([], dtype=np.float64)
+            return sample
+
+        # load videos
+        loaded_video_keys = sample[self.video_key]
+        sample, videos = load_data_with_context(sample, context, loaded_video_keys, load_video)
+
+        aesthetics_scores = []
+        for key, video in videos.items():
+            sampled_frames_key = key + self.sampled_frames_key_suffix
+            if video is None:
+                continue
+            elif context and sampled_frames_key in sample[Fields.context]:
+                # sampled frames can be found in the context
+                frames = sample[Fields.context][sampled_frames_key]
+            else:
+                # extract frame images
+                if self.frame_sampling_method == "all_keyframes":
+                    frames = extract_key_frames(video)
+                elif self.frame_sampling_method == "uniform":
+                    frames = extract_video_frames_uniformly(video, self.frame_num)
+                else:
+                    frames = []
+
+                # store the sampled frames in the context
+                if context:
+                    sample[Fields.context][sampled_frames_key] = frames
+            frame_images = [frame.to_image() for frame in frames]
+
+            if len(frame_images) > 0:
+                # compute aesthetics_scores
+                # model, processor = get_model(self.model_key, rank=rank, use_cuda=self.use_cuda())
+                inputs = processor(images=frame_images, return_tensors="pt").to(model.device)
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                if self.need_normalized_by_ten:
+                    aesthetics_score = outputs.logits / 10.0
+                else:
+                    aesthetics_score = outputs.logits
+
+                if self.reduce_mode == "avg":
+                    aesthetics_score = float(aesthetics_score.mean())
+                elif self.reduce_mode == "max":
+                    aesthetics_score = float(aesthetics_score.max())
+                else:
+                    aesthetics_score = float(aesthetics_score.min())
+            else:
+                aesthetics_score = 0.0
+
+            aesthetics_scores.append(aesthetics_score)
+
+        logger.debug(f"aesthetics_score: {aesthetics_scores}")
+
+        sample[Fields.stats][StatsKeys.video_frames_aesthetics_score] = aesthetics_scores
+
+        if not context:
+            for vid_key in videos:
+                close_video(videos[vid_key])
+
+        return sample
+
     def compute_stats_single(self, sample, rank=None, context=False):
         # check if it's computed already
         if StatsKeys.video_frames_aesthetics_score in sample[Fields.stats]:
             return sample
-
         # there is no video in this sample
         if self.video_key not in sample or not sample[self.video_key]:
             sample[Fields.stats][StatsKeys.video_frames_aesthetics_score] = np.array([], dtype=np.float64)
@@ -190,7 +268,10 @@ class VideoAestheticsFilter(Filter):
             return True
 
         keep_bools = np.array(
-            [self.min_score <= aesthetics_score <= self.max_score for aesthetics_score in aesthetics_scores]
+            [
+                self.get_keep_boolean(aesthetics_score, self.min_score, self.max_score)
+                for aesthetics_score in aesthetics_scores
+            ]
         )
 
         # different strategies

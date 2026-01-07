@@ -155,7 +155,7 @@ class ProcessDataRayTest(DataJuicerTestCaseBase):
                         'trust_remote_code': True,
                         'max_score': 0.5,
                         'any_or_all': 'any',
-                        'mem_required': '8GB'
+                        'memory': '8GB'
                     },
                     'image_aspect_ratio_filter':{
                         'min_ratio': 0.5,

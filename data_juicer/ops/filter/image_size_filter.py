@@ -8,9 +8,13 @@ from ..base_op import OPERATORS, Filter
 
 @OPERATORS.register_module("image_size_filter")
 class ImageSizeFilter(Filter):
-    """Keep data samples whose image size (in Bytes/KB/MB/...) within a
-    specific range.
-    """
+    """Keep data samples whose image size (in Bytes/KB/MB/...) is within a specific range.
+
+    This operator filters data samples based on the size of their images. It keeps samples
+    if the image sizes fall within the specified minimum and maximum size range. The operator
+    supports two strategies: 'any'(keep the sample if any image meets the size condition) and
+    'all' (keep the sample only if all images meet the size condition). If no images are
+    present in the sample, the 'image_sizes' field will be an empty array."""
 
     _batched_op = True
 
@@ -58,7 +62,9 @@ class ImageSizeFilter(Filter):
 
     def process_single(self, sample):
         image_sizes = sample[Fields.stats][StatsKeys.image_sizes]
-        keep_bools = np.array([self.min_size <= image_size <= self.max_size for image_size in image_sizes])
+        keep_bools = np.array(
+            [self.get_keep_boolean(image_size, self.min_size, self.max_size) for image_size in image_sizes]
+        )
         if len(keep_bools) <= 0:
             return True
 

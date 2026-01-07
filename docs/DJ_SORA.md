@@ -21,15 +21,16 @@ This project is being actively updated and maintained. We eagerly invite you to 
 
 ## Roadmap
 ### Overview
-- [Motivation](#motivation)
-- [Roadmap](#roadmap)
-  - [Overview](#overview)
-  - [Support high-performance loading and processing of video data](#support-high-performance-loading-and-processing-of-video-data)
-  - [Basic Operators (video spatio-temporal dimension)](#basic-operators-video-spatio-temporal-dimension)
-  - [Advanced Operators (fine-grained modal matching and data generation)](#advanced-operators-fine-grained-modal-matching-and-data-generation)
-  - [Advanced Operators (Video Content)](#advanced-operators-video-content)
-  - [DJ-SORA Data Recipes and Datasets](#dj-sora-data-recipes-and-datasets)
-  - [DJ-SORA Data Validation and Model Training](#dj-sora-data-validation-and-model-training)
+- [DJ-SORA](#dj-sora)
+  - [Motivation](#motivation)
+  - [Roadmap](#roadmap)
+    - [Overview](#overview)
+    - [Support high-performance loading and processing of video data](#support-high-performance-loading-and-processing-of-video-data)
+    - [Basic Operators (video spatio-temporal dimension)](#basic-operators-video-spatio-temporal-dimension)
+    - [Advanced Operators (fine-grained modal matching and data generation)](#advanced-operators-fine-grained-modal-matching-and-data-generation)
+    - [Advanced Operators (Video Content)](#advanced-operators-video-content)
+    - [DJ-SORA Data Recipes and Datasets](#dj-sora-data-recipes-and-datasets)
+    - [DJ-SORA Data Validation and Model Training](#dj-sora-data-validation-and-model-training)
 
 
 ### Support high-performance loading and processing of video data
@@ -113,6 +114,6 @@ This project is being actively updated and maintained. We eagerly invite you to 
     - ...
   - [✅] (Model-Data sandbox) With relatively small models and the DJ-SORA dataset, exploring low-cost, transferable, and instructive data-model co-design, configurations and checkpoints. 
   - [ ] [WIP] Training SORA-like models with DJ-SORA data on  larger scales and in more scenarios to improve model performance.
-    - [✅] Data-Juicer-T2V, [V-Bench Top1 model](https://huggingface.co/datajuicer/Data-Juicer-T2V-v2). Please refer [here](./Sandbox.md) for more details.
+    - [✅] Data-Juicer-T2V, [V-Bench Top1 model](https://huggingface.co/datajuicer/Data-Juicer-T2V-v2). Please refer [here](https://datajuicer.github.io/data-juicer-sandbox/en/main/index.html) for more details.
     - ...
   - ...

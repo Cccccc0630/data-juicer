@@ -1,22 +1,28 @@
 import copy
+import time
+from datetime import datetime
 from functools import wraps
 
 import numpy as np
 import pyarrow as pa
-from loguru import logger
+import pytz
 
-from data_juicer import is_cuda_available
 from data_juicer.utils.constant import Fields
-from data_juicer.utils.mm_utils import SpecialTokens, size_to_bytes
-from data_juicer.utils.model_utils import free_models
+from data_juicer.utils.mm_utils import size_to_bytes
+from data_juicer.utils.model_utils import free_models, get_model
 from data_juicer.utils.process_utils import calculate_np
+from data_juicer.utils.ray_utils import is_ray_mode
 from data_juicer.utils.registry import Registry
+from data_juicer.utils.resource_utils import is_cuda_available
 
 OPERATORS = Registry("Operators")
 UNFORKABLE = Registry("Unforkable")
 NON_STATS_FILTERS = Registry("Non-stats Filters")
 TAGGING_OPS = Registry("Tagging Operators")
 ATTRIBUTION_FILTERS = Registry("Attribution Filters")
+DEFAULT_BATCH_SIZE = 1000
+
+beijing_tz = pytz.timezone("Asia/Singapore")
 
 
 def convert_list_dict_to_dict_list(samples):
@@ -155,8 +161,26 @@ class OP:
         :param history_key: the key name of field that stores history of
             queries and responses
         :param index_key: index the samples before process if not None
+        :param system_key: the key name of field that stores system prompts
+        :param instruction_key: the key name of field that stores instruction
+        :param index_key: the key name of field that stores index
         :param batch_size: the batch size for processing
         :param work_dir: the working directory for this operator
+        :param skip_op_error: whether to skip the error when processing samples
+
+        # Ray related parameters
+        :param num_cpus: number of CPUs required for this operator, only used when
+            running in Ray mode
+        :param num_gpus: number of GPUs required for this operator, only used when
+            running in Ray mode
+        :param memory: memory size required for this operator, only used when
+            running in Ray mode
+        :param runtime_env: runtime environment for this operator, only used when
+            running in Ray mode. More details can be found in Ray documentation.
+        :param ray_execution_mode: execution mode in Ray, can be "actor" or "task" or None,
+            if None, the "actor" mode is used when the operator is a CUDA operator,
+            and the "task" mode is used if the operator is a CPU operator.
+
         """
         # init data keys
         self.text_key = kwargs.get("text_key", "text")
@@ -167,13 +191,14 @@ class OP:
         # extra mm bytes keys
         self.image_bytes_key = kwargs.get("image_bytes_key", "image_bytes")
 
+        self.system_key = kwargs.get("system_key", "system")
+        self.instruction_key = kwargs.get("instruction_key", "instruction")
+        self.prompt_key = kwargs.get("prompt_key", "prompt")
         self.query_key = kwargs.get("query_key", "query")
         self.response_key = kwargs.get("response_key", "response")
         self.history_key = kwargs.get("history_key", "history")
 
         self.index_key = kwargs.get("index_key", None)
-
-        self.batch_size = kwargs.get("batch_size", 1000)
         self.work_dir = kwargs.get("work_dir", None)
 
         # for unittest, do not skip the error.
@@ -187,19 +212,52 @@ class OP:
         else:
             self.accelerator = self._accelerator
 
+        if self.accelerator == "cuda":
+            self.batch_size = kwargs.get("batch_size", 10)
+        else:
+            self.batch_size = kwargs.get("batch_size", DEFAULT_BATCH_SIZE)
+
         # parameters to determine the number of procs for this op
-        self.num_proc = kwargs.get("num_proc", None)
-        self.cpu_required = kwargs.get("cpu_required", 1)
-        self.mem_required = kwargs.get("mem_required", 0)
+        self.num_proc = kwargs.get("num_proc", -1)  # -1 means automatic calculation of concurrency
+        self.cpu_required = kwargs.get("cpu_required", None)
+        self.gpu_required = kwargs.get("gpu_required", None)
+        self.mem_required = kwargs.get("mem_required", None)
         if isinstance(self.mem_required, str):
             self.mem_required = size_to_bytes(self.mem_required) / 1024**3
 
+        self.num_cpus = kwargs.get("num_cpus", None)
+        self.num_gpus = kwargs.get("num_gpus", None)
+        self.memory = kwargs.get("memory", None)
+        if self.memory and isinstance(self.memory, str):
+            self.memory = size_to_bytes(self.memory) / 1024**3
+        # Optional[Union[Dict[str, Any], "RuntimeEnv"]]
+        self.runtime_env = kwargs.get("runtime_env", None)
+        self.ray_execution_mode = kwargs.get("ray_execution_mode", None)
+        assert self.ray_execution_mode in [None, "actor", "task"]
+
+        # Local import to avoid logger being serialized in multiprocessing
+        from loguru import logger
+
+        if self.cpu_required:
+            logger.warning(
+                "The argument ``cpu_required`` will be deprecated. Please specify argument ``num_cpus`` instead."
+            )
+            if self.num_cpus is None:
+                self.num_cpus = self.cpu_required
+        if self.gpu_required:
+            logger.warning(
+                "The argument ``gpu_required`` will be deprecated. Please specify argument ``num_gpus`` instead."
+            )
+            if self.num_gpus is None:
+                self.num_gpus = self.gpu_required
+        if self.mem_required:
+            logger.warning(
+                "The argument ``mem_required`` will be deprecated. Please specify argument ``memory`` instead."
+            )
+            if self.memory is None:
+                self.memory = self.mem_required
+
         self.turbo = kwargs.get("turbo", False)
-        # update special tokens
-        SpecialTokens.image = kwargs.get("image_special_token", SpecialTokens.image)
-        SpecialTokens.audio = kwargs.get("audio_special_token", SpecialTokens.audio)
-        SpecialTokens.video = kwargs.get("video_special_token", SpecialTokens.video)
-        SpecialTokens.eoc = kwargs.get("eoc_special_token", SpecialTokens.eoc)
 
         # nested wrappers
         from data_juicer.core.data import wrap_func_with_nested_access
@@ -211,8 +269,20 @@ class OP:
                 method = wrap_func_with_nested_access(method)
                 setattr(self, name, method)
 
+    def use_auto_proc(self):
+        if is_ray_mode() and not self.use_cuda():  # ray task
+            return self.num_proc == -1
+        else:
+            return not self.num_proc or self.num_proc == -1
+
     def is_batched_op(self):
         return self._batched_op
+
+    def use_ray_actor(self):
+        if self.ray_execution_mode:
+            return self.ray_execution_mode == "actor"
+
+        return self.use_cuda()
 
     def process(self, *args, **kwargs):
         raise NotImplementedError
@@ -221,7 +291,12 @@ class OP:
         return self.accelerator == "cuda" and is_cuda_available()
 
     def runtime_np(self):
-        op_proc = calculate_np(self._name, self.mem_required, self.cpu_required, self.num_proc, self.use_cuda())
+        # Local import to avoid logger being serialized in multiprocessing
+        from loguru import logger
+
+        op_proc = calculate_np(self._name, self.memory, self.num_cpus or 1, self.use_cuda(), self.num_gpus)
+        if not self.use_auto_proc():
+            op_proc = min(op_proc, self.num_proc)
         logger.debug(f"Op [{self._name}] running with number of procs:{op_proc}")
         return op_proc
 
@@ -288,7 +363,24 @@ class OP:
         return dataset
 
     def empty_history(self):
+        if is_ray_mode():
+            return []
+
         return np.empty((0, 0), dtype=str)
+
+    def load_model(self, rank=None):
+
+        start = time.time()
+        start_time = datetime.fromtimestamp(start, pytz.utc).astimezone(beijing_tz)
+        model, processor = get_model(self.model_key, rank=rank, use_cuda=self.use_cuda())
+        end = time.time()
+        end_time = datetime.fromtimestamp(end, pytz.utc).astimezone(beijing_tz)
+        print(
+            f"[Actor] {self._name} Model loaded in {end - start:.3f} seconds "
+            f"from {start_time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"to {end_time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        return model, processor
 
 
 class Mapper(OP):
@@ -404,9 +496,24 @@ class Filter(OP):
         :param response_key: the key name of field that stores responses
         :param history_key: the key name of field that stores history of
             queries and responses
+
+        :param min_closed_interval: whether the min_val of the specified filter range is a closed interval. It's True
+            by default.
+        :param max_closed_interval: whether the max_val of the specified filter range is a closed interval. It's True
+            by default.
+        :param reversed_range: whether to reverse the target range [min_val, max_val] to (-∞, min_val) or (max_val, +∞).
+            It's False by default.
         """
         super(Filter, self).__init__(*args, **kwargs)
         self.stats_export_path = kwargs.get("stats_export_path", None)
+
+        # filter strategy related
+        self.min_closed_interval = kwargs.get("min_closed_interval", True)
+        self.max_closed_interval = kwargs.get("max_closed_interval", True)
+        self.reversed_range = kwargs.get("reversed_range", False)
+        if self.reversed_range:
+            self.min_closed_interval = not self.min_closed_interval
+            self.max_closed_interval = not self.max_closed_interval
 
         # runtime wrappers
         if self.is_batched_op():
@@ -438,6 +545,16 @@ class Filter(OP):
 
     def __call__(self, *args, **kwargs):
         return self.compute_stats(*args, **kwargs)
+
+    def get_keep_boolean(self, val, min_val=None, max_val=None):
+        res_bool = True
+        if min_val is not None:
+            res_bool = res_bool and (val >= min_val if self.min_closed_interval else val > min_val)
+        if max_val is not None:
+            res_bool = res_bool and (val <= max_val if self.max_closed_interval else val < max_val)
+        if self.reversed_range:
+            res_bool = not res_bool
+        return res_bool
 
     def compute_stats_batched(self, samples, *args, **kwargs):
         keys = samples.keys()
@@ -704,3 +821,33 @@ class Aggregator(OP):
             tracer.trace_mapper(self._name, dataset, new_dataset, self.text_key)
         free_models()
         return new_dataset
+
+
+class Pipeline(OP):
+    """Base class for Operators that represent a data processing pipeline."""
+
+    def __init__(self, *args, **kwargs):
+        """
+        Base class of operators.
+
+        :param text_key: the key name of field that stores sample texts
+            to be processed.
+        :param image_key: the key name of field that stores sample image list
+            to be processed
+        :param audio_key: the key name of field that stores sample audio list
+            to be processed
+        :param video_key: the key name of field that stores sample video list
+            to be processed
+        :param image_bytes_key: the key name of field that stores sample image bytes list
+            to be processed
+        :param query_key: the key name of field that stores sample queries
+        :param response_key: the key name of field that stores responses
+        :param history_key: the key name of field that stores history of
+            queries and responses
+        :param index_key: index the samples before process if not None
+        :param batch_size: the batch size for processing
+        """
+        super(Pipeline, self).__init__(*args, **kwargs)
+
+    def run(self, dataset):
+        raise NotImplementedError

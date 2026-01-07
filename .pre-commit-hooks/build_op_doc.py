@@ -2,11 +2,17 @@ import ast
 import json
 import os
 import re
+from pathlib import Path
 from typing import Any, List
 
 import translators as ts
 
 DOC_PATH = "docs/Operators.md"
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DOC_OP_PATH = ROOT / "docs/operators"
+
 
 # >>> some constant doc contents
 DOC_ABSTRACT = """
@@ -19,21 +25,30 @@ sources and file formats, and allow for flexible extension to custom datasets.
 算子 (Operator) 是协助数据修改、清理、过滤、去重等基本流程的集合。我们支持广泛的数据来源和文件格式，并支持对自定义数据集的灵活扩展。
 
 This page offers a basic description of the operators (OPs) in Data-Juicer.
-Users can refer to the
-[API documentation](https://modelscope.github.io/data-juicer/) for the specific
-parameters of each operator. Users can refer to and run the unit tests
-(`tests/ops/...`) for [examples of operator-wise usage](../tests/ops) as well
-as the effects of each operator when applied to built-in test data samples.
-Besides, you can try to use agent to automatically route suitable OPs and
-call them. E.g., refer to
-[Agentic Filters of DJ](../demos/api_service/react_data_filter_process.ipynb),
- [Agentic Mappers of DJ](../demos/api_service/react_data_mapper_process.ipynb)
+Users can consult the
+[API documentation](https://datajuicer.github.io/data-juicer/en/main/api.html)
+for the operator API reference. To learn more about each operator, click its
+adjacent 'info' link to access the operator's details page, which includes its
+detailed parameters, effect demonstrations, and links to relevant unit tests
+and source code.
 
-这个页面提供了OP的基本描述，用户可以参考[API文档](https://modelscope.github.io/data-juicer/)更细致了解每个
-OP的具体参数，并且可以查看、运行单元测试 (`tests/ops/...`)，来体验
-[各OP的用法示例](../tests/ops)以及每个OP作用于内置测试数据样本时的效果。例如，参考
-[Agentic Filters of DJ](../demos/api_service/react_data_filter_process.ipynb),
- [Agentic Mappers of DJ](../demos/api_service/react_data_mapper_process.ipynb)
+Additionally, the 'Reference' column in the table is intended to cite research,
+libraries, or resource links that the operator's design or implementation is
+based on. We welcome contributions of known or relevant reference sources to
+enrich this section.
+
+Users can also refer to and run the unit tests (`tests/ops/...`) for
+[examples of operator-wise usage](../tests/ops) as well as the effects of each
+operator when applied to built-in test data samples. Besides, you can try to
+use agent to automatically route suitable OPs and call them. E.g., refer to
+[Agentic Filters of DJ](../demos/api_service/react_data_filter_process.ipynb), [Agentic Mappers of DJ](../demos/api_service/react_data_mapper_process.ipynb)
+
+这个页面提供了Data-Juicer中算子的基本描述。算子的API参考，用户可以直接查阅[API文档](https://datajuicer.github.io/data-juicer/en/main/api.html)。
+要详细了解每个算子，请点击其旁的info链接进入算子详情页，其中包含了算子参数、效果演示，以及相关单元测试和源码的链接。
+
+此外，表格中的『参考』（Reference）列则用于注明算子设计或实现所依据的研究、库或资料链接，欢迎您提供已知或相关的参考来源，共同完善此部分内容。
+
+用户还可以查看、运行单元测试 (`tests/ops/...`)，来体验[各OP的用法示例](../tests/ops)以及每个OP作用于内置测试数据样本时的效果。例如，参考[Agentic Filters of DJ](../demos/api_service/react_data_filter_process.ipynb), [Agentic Mappers of DJ](../demos/api_service/react_data_mapper_process.ipynb)
 """
 
 DOC_CONTRIBUTING = """
@@ -54,6 +69,7 @@ OP_TYPE_DESC = {
     "grouper": "Group samples to batched samples. 将样本分组，每一组组成一个批量样本。",
     "aggregator": "Aggregate for batched samples, such as summary or conclusion. "
     "对批量样本进行汇总，如得出总结或结论。",
+    "pipeline": "Applies dataset-level processing; both input and output are datasets. 执行数据集级别的操作，输入和输出均为完整数据集。",
 }
 # <<<
 
@@ -69,6 +85,11 @@ FORMATTER_EXCLUDE = {"__init__.py", "load.py"}
 
 # load OP tag mappings
 ALL_TAG_MAPPING = json.load(open(os.path.join(os.path.dirname(os.path.realpath(__file__)), "tag_mappings.json")))
+
+
+def find_md(pattern: str):
+    matches = list(DOC_OP_PATH.rglob(pattern))
+    return matches[0] if matches else None
 
 
 def replace_tags_with_icons(tags, lang="en"):
@@ -182,25 +203,39 @@ class OPRecord:
     the doc.
     """
 
-    def __init__(self, type: str, name: str, desc: str, tags: List[str] = None, code: str = None, test: str = None):
+    def __init__(
+        self,
+        type: str,
+        name: str,
+        desc: str,
+        desc_zh: str = None,
+        tags: List[str] = None,
+        test: str = None,
+        info: str = None,
+        ref: str = None,
+    ):
         self.type = type
         self.name = name
         self.tags = tags if tags else []
         self.desc = desc
-        self.code = code
+        self.desc_zh = desc_zh
         self.test = test
+        self.info = info
+        self.ref = ref
 
     def __repr__(self):
-        return f"{self.type}, {self.name}, {self.tags}, {self.desc}, " f"{self.code}, {self.test}"
+        return f"{self.type}, {self.name}, {self.tags}, {self.desc}, {self.desc_zh}, {self.info}, {self.ref}"
 
     def __eq__(self, other):
+        # Do not compare test properties
+        # And do not compare the Chinese description
         return (
             self.type == other.type
             and self.name == other.name
             and set(self.tags) == set(other.tags)
             and self.desc == other.desc
-            and self.code == other.code
-            and self.test == other.test
+            and self.info == other.info
+            and self.ref == other.ref
         )
 
     def __ne__(self, other):
@@ -271,14 +306,17 @@ def get_op_list_from_code_for_formatter():
                         type=type,
                         name=name,
                         desc=doc,
-                        code=code_path,
                         test=test_path,
+                        info=info_link(name),
+                        ref=ref_link(name),
                     )
                 )
         else:
             code_path = os.path.join(FORMATTER_CODE_PREFIX, formatter)
             test_path = os.path.join(FORMATTER_TEST_PREFIX, f"test_{formatter}")
             if os.path.isdir(code_path):
+                continue
+            if "_cpp" in code_path:
                 continue
             docstrings = get_class_and_docstring(code_path)
             _, doc = docstrings[0]
@@ -287,8 +325,9 @@ def get_op_list_from_code_for_formatter():
                     type=type,
                     name=formatter.replace(".py", ""),
                     desc=doc,
-                    code=code_path,
                     test=test_path if os.path.exists(test_path) else "-",
+                    info=info_link(formatter.replace(".py", "")),
+                    ref=ref_link(formatter.replace(".py", "")),
                 )
             )
     return op_record_list
@@ -314,26 +353,32 @@ def get_op_list_from_code():
             test_path = os.path.join(OP_TEST_PREFIX, type, f"test_{op}")
             if os.path.isdir(code_path):
                 continue
+            if not code_path.endswith(".py") or "_cpp" in code_path:
+                continue
             docstrings = get_class_and_docstring(code_path)
             _, doc = docstrings[0]
+            info = info_link(op.replace(".py", ""))
             op_record_list.append(
                 OPRecord(
                     type=type,
                     name=op.replace(".py", ""),
                     desc=doc,
                     tags=analyze_tag_from_code(code_path),
-                    code=code_path,
                     test=test_path if os.path.exists(test_path) else "-",
+                    info=info,
+                    ref=ref_link(op.replace(".py", "")),
                 )
             )
     op_record_list.sort(key=lambda record: (record.type, record.name))
     return op_record_list
 
 
-def generate_new_doc(op_record_list):
+def generate_new_doc(op_record_list, old_op_record_list):
     """
     Generate new docs for the updated OP records.
     """
+    reference_op_record_dict = {record.name: record for record in old_op_record_list}
+
     op_record_dict = {}
     for record in op_record_list:
         op_record_dict.setdefault(record.type, []).append(record)
@@ -343,7 +388,7 @@ def generate_new_doc(op_record_list):
     doc.append(generate_overview(op_record_dict))
     # make OP tables
     for op_type, op_records in op_record_dict.items():
-        doc.append(generate_op_table_section(op_type, op_records))
+        doc.append(generate_op_table_section(op_type, op_records, reference_op_record_dict))
     # add
     doc.append(DOC_CONTRIBUTING)
 
@@ -390,28 +435,62 @@ def generate_overview(op_record_dict):
     return "\n\n".join(doc)
 
 
-def generate_op_table_section(op_type, op_record_list):
+def info_link(name):
+    rd_link = find_md(f"{name}.md")
+    if rd_link:
+        rd_link = os.path.relpath(rd_link.relative_to(ROOT), "docs")
+        return f"[info]({rd_link})"
+    else:
+        return "-"
+
+
+def ref_link(name):
+    return "-"
+
+
+def generate_op_table_section(op_type, op_record_list, reference_op_record_dict):
     """
     Generate the OP table section for the given OP type and the OP record list.
+
+    For Chinese descriptions of OPs, if any of the following condition meets, it will keep the old version:
+    1. the English description is unchanged
+    2. the translation procedure is failed
     """
     # make the header
     doc = [f'## {op_type} <a name="{op_type}"/>']
     # make the OP table
     table = [
-        "| Operator 算子 | Tags 标签 | Description 描述 | Source code 源码 |" " Unit tests 单测样例 |",
-        "|----------|------|-------------|-------------|------------|",
+        "| Operator 算子 | Tags 标签 | Description 描述 | Details 详情 | Reference 参考 |",
+        "|----------|------|-------------|-------------|-------------|",
     ]
-    trans_descs = get_op_desc_in_en_zh_batched([record.desc for record in op_record_list])
+    # only translate for the different descriptions
+    dif_indices = [
+        i
+        for i, record in enumerate(op_record_list)
+        if record.name not in reference_op_record_dict or record.desc != reference_op_record_dict.get(record.name).desc
+    ]
+    zh_update_map = {}
+    if len(dif_indices) > 0:
+        dif_descs = [op_record_list[i].desc for i in dif_indices]
+        trans_zh_descs = get_op_desc_in_en_zh_batched(dif_descs)
+        if trans_zh_descs is None:
+            # translation failed --> keep the old version
+            trans_zh_descs = [
+                (
+                    reference_op_record_dict.get(op_record_list[i].name).desc_zh
+                    if reference_op_record_dict.get(op_record_list[i].name)
+                    else "-"
+                )
+                for i in dif_indices
+            ]
+        zh_update_map = dict(zip(dif_indices, trans_zh_descs))
     for i, record in enumerate(op_record_list):
         tags = " ".join(replace_tags_with_icons(record.tags))
-        tests = f'[tests]({os.path.join("..", record.test)})' if record.test != "-" else "-"
-        op_row = (
-            f"| {record.name} "
-            f"| {tags} "
-            f"| {trans_descs[i]} "
-            f'| [code]({os.path.join("..", record.code)}) '
-            f"| {tests} |"
-        )
+        info = record.info
+        ref = record.ref
+        old_record = reference_op_record_dict.get(record.name)
+        zh_desc = zh_update_map.get(i, old_record.desc_zh if old_record else "-")
+        op_row = f"| {record.name} " f"| {tags} " f"| {record.desc} {zh_desc.strip()} " f"| {info} " f"| {ref} |"
         table.append(op_row)
     doc.append("\n".join(table))
     return "\n\n".join(doc)
@@ -419,11 +498,22 @@ def generate_op_table_section(op_type, op_record_list):
 
 def get_op_desc_in_en_zh_batched(descs):
     separator = "\n"
+    limit = int(5e3)
     batch = separator.join(descs)
-    res = ts.translate_text(batch, translator="alibaba", from_language="en", to_language="zh")
+    if len(batch) > limit:
+        # split
+        split_idx = int(len(descs) / 2)
+        res1 = get_op_desc_in_en_zh_batched(descs[:split_idx])
+        res2 = get_op_desc_in_en_zh_batched(descs[split_idx:])
+        return res1 + res2
+    else:
+        try:
+            res = ts.translate_text(batch, translator="alibaba", from_language="en", to_language="zh")
+        except Exception:
+            return None
     zhs = res.split(separator)
     assert len(zhs) == len(descs)
-    return [desc + " " + zh.strip() for desc, zh in zip(descs, zhs)]
+    return zhs
 
 
 def parse_op_record_from_current_doc():
@@ -432,14 +522,13 @@ def parse_op_record_from_current_doc():
     """
     # patterns
     tab_pattern = r"\| +(.*?) +\| +(.*?) +\| +(.*?) +\| +(.*?) +\| +(.*?) +\|"
-    link_pattern = r"\[.*?\]\((.*?)\)"
 
     if os.path.exists(DOC_PATH):
         op_record_list = []
         with open(DOC_PATH, "r", encoding="utf-8") as fin:
             content = fin.read()
             res = re.findall(tab_pattern, content)
-            for name, tags, desc, code, test in res:
+            for name, tags, desc, info, ref in res:
                 # skip table header
                 if name == "Operator 算子":
                     continue
@@ -447,17 +536,20 @@ def parse_op_record_from_current_doc():
                 type = name.split("_")[-1]
                 tags = [remove_emojis(tag.lower()) for tag in tags.split(" ")]
                 # only need English description
-                desc = desc.split(". ")[0] + "."
-                code = re.findall(link_pattern, code)[0]
-                test = re.findall(link_pattern, test)
+                desc_parts = desc.split(". ")
+                desc = desc_parts[0] + "."
+                desc_zh = ". ".join(desc_parts[1:])
+                test_path = os.path.join(OP_TEST_PREFIX, type, f"test_{name}.py")
                 op_record_list.append(
                     OPRecord(
                         type=type,
                         name=name,
                         desc=desc,
+                        desc_zh=desc_zh,
                         tags=tags,
-                        code=code.replace("../", ""),
-                        test=test[0].replace("../", "") if len(test) > 0 else "-",
+                        test=test_path if os.path.exists(test_path) else "-",
+                        info=info,
+                        ref=ref if len(ref) > 0 else "-",
                     )
                 )
         op_record_list.sort(key=lambda record: (record.type, record.name))
@@ -490,6 +582,7 @@ def check_and_update_op_record(old_op_record_list, new_op_record_list):
     usability_tag_set = set(ALL_TAG_MAPPING["Usability Tags"].keys())
     old_op_record_dict = {record.name: record for record in old_op_record_list}
     updated_op_record_list = []
+
     for record in new_op_record_list:
         # check unittest
         test = record.test
@@ -497,6 +590,7 @@ def check_and_update_op_record(old_op_record_list, new_op_record_list):
             usability_tag = "alpha"
         else:
             usability_tag = "beta"
+
         if record.name in old_op_record_dict:
             # get the old usability tag
             old_record = old_op_record_dict[record.name]
@@ -508,9 +602,18 @@ def check_and_update_op_record(old_op_record_list, new_op_record_list):
             if old_usability_tag and old_usability_tag == "stable" and usability_tag == "beta":
                 print(f"{record.name} kept stable")
                 usability_tag = "stable"
+
+            new_ref = record.ref if record.ref is not None else "-"
+            old_ref = old_record.ref if old_record.ref is not None else "-"
+            if (new_ref == "-" or new_ref == "") and (old_ref != "-" and old_ref != ""):
+                record.ref = old_ref
+        else:
+            pass
+
         curr_tags = [tag for tag in record.tags if tag not in usability_tag_set]
         curr_tags.append(usability_tag)
         record.tags = curr_tags
+
         updated_op_record_list.append(record)
 
     return updated_op_record_list
@@ -524,7 +627,7 @@ def main():
     if old_op_record_list == updated_op_record_list:
         exit(0)
     else:
-        generate_new_doc(updated_op_record_list)
+        generate_new_doc(updated_op_record_list, old_op_record_list)
         print("Operator document is updated.")
         exit(1)
 

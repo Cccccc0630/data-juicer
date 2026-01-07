@@ -1,9 +1,17 @@
 import unittest
+import os
+import shutil
 
 from data_juicer.core.data import NestedDataset as Dataset
 
-from data_juicer.ops.deduplicator.ray_bts_minhash_deduplicator import \
-    RayBTSMinhashDeduplicator
+from data_juicer.ops.deduplicator.ray_bts_minhash_deduplicator import (
+    RayBTSMinhashDeduplicator,
+    RayBTSMinhashDeduplicatorWithUid,
+)
+from data_juicer.ops.deduplicator.ray_bts_minhash_cpp_deduplicator import (
+    RayBTSMinhashCppDeduplicator,
+)
+from data_juicer.utils.constant import HashKeys
 from data_juicer.utils.unittest_utils import DataJuicerTestCaseBase, TEST_TAG
 
 
@@ -817,10 +825,22 @@ class RayBTSMinhashDeduplicatorTest(DataJuicerTestCaseBase):
             },
         ]
         dataset = self.generate_dataset(ds_list)
-        import os
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         work_dir = os.path.join(cur_dir, 'english_dedup')
         op = RayBTSMinhashDeduplicator(ignore_pattern=r'\p{P}', work_dir=work_dir)
+        self._run_minhash_dedup(dataset, tgt_list, op)
+        shutil.rmtree(work_dir)
+
+        dataset = self.generate_dataset(ds_list)
+        op = RayBTSMinhashCppDeduplicator(ignore_pattern=r'\p{P}',
+                                          work_dir=work_dir)
+        self._run_minhash_dedup(dataset, tgt_list, op)
+        shutil.rmtree(work_dir)
+
+        for i, ds in enumerate(ds_list):
+            ds[HashKeys.uid] = i
+        dataset = self.generate_dataset(ds_list)
+        op = RayBTSMinhashDeduplicatorWithUid(ignore_pattern=r'\p{P}')
         self._run_minhash_dedup(dataset, tgt_list, op)
 
     @TEST_TAG("ray")
@@ -830,7 +850,10 @@ class RayBTSMinhashDeduplicatorTest(DataJuicerTestCaseBase):
                 'text': '你好，请问你是谁'
             },
             {
-                'text': '欢迎来到阿里巴巴！'
+                'text': '你好，请问你是谁'
+            },
+            {
+                'text': '欢迎来到阿里巴巴通义实验室！'
             },
             {
                 'text':
@@ -914,7 +937,7 @@ class RayBTSMinhashDeduplicatorTest(DataJuicerTestCaseBase):
                 'text': '你好，请问你是谁'
             },
             {
-                'text': '欢迎来到阿里巴巴！'
+                'text': '欢迎来到阿里巴巴通义实验室！'
             },
             {
                 'text':
@@ -956,12 +979,26 @@ class RayBTSMinhashDeduplicatorTest(DataJuicerTestCaseBase):
             },
         ]
         dataset = self.generate_dataset(ds_list)
-        import os
         cur_dir = os.path.dirname(os.path.abspath(__file__))
         work_dir = os.path.join(cur_dir, 'chinese_dedup')
         op = RayBTSMinhashDeduplicator(tokenization='character',
                                        ignore_pattern=r'\p{P}',
                                        work_dir=work_dir)
+        self._run_minhash_dedup(dataset, tgt_list, op)
+        shutil.rmtree(work_dir)
+
+        dataset = self.generate_dataset(ds_list)
+        op = RayBTSMinhashCppDeduplicator(tokenization='character',
+                                          ignore_pattern=r'\p{P}',
+                                          work_dir=work_dir)
+        self._run_minhash_dedup(dataset, tgt_list, op)
+        shutil.rmtree(work_dir)
+
+        for i, ds in enumerate(ds_list):
+            ds[HashKeys.uid] = i
+        dataset = self.generate_dataset(ds_list)
+        op = RayBTSMinhashDeduplicatorWithUid(tokenization='character',
+                                              ignore_pattern=r'\p{P}')
         self._run_minhash_dedup(dataset, tgt_list, op)
 
 

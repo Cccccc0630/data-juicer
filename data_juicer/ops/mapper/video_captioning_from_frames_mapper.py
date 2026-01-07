@@ -34,9 +34,20 @@ OP_NAME = 'video_captioning_from_frames_mapper'
 @OPERATORS.register_module(OP_NAME)
 @LOADED_VIDEOS.register_module(OP_NAME)
 class VideoCaptioningFromFramesMapper(Mapper):
-    """Mapper to generate samples whose captions are generated based on
-    an image-to-text model and sampled video frames. Captions from different
-    frames will be concatenated to a single string."""
+    """Generates video captions from sampled frames using an image-to-text model. Captions from
+    different frames are concatenated into a single string.
+
+    - Uses a Hugging Face image-to-text model to generate captions for sampled video frames.
+    - Supports different frame sampling methods: 'all_keyframes' or 'uniform'.
+    - Can apply horizontal and vertical flips to the frames before captioning.
+    - Offers multiple strategies for retaining generated captions: 'random_any',
+    'similar_one_simhash', or 'all'.
+    - Optionally keeps the original sample in the final dataset.
+    - Allows setting a global prompt or per-sample prompts to guide caption generation.
+    - Generates a specified number of candidate captions per video, which can be reduced
+    based on the selected retention strategy.
+    - The number of output samples depends on the retention strategy and whether original
+    samples are kept."""
 
     _accelerator = 'cuda'
     _batched_op = True
@@ -61,6 +72,7 @@ class VideoCaptioningFromFramesMapper(Mapper):
         Initialization method.
 
         :param hf_img2seq: model name on huggingface to generate caption
+        :param trust_remote_code: whether to trust the remote code of HF models.
         :param caption_num: how many candidate captions to generate
             for each video
         :param keep_candidate_mode: retain strategy for the generated
@@ -112,7 +124,7 @@ class VideoCaptioningFromFramesMapper(Mapper):
         :param args: extra args
         :param kwargs: extra args
         """
-        kwargs.setdefault('mem_required', '20GB')
+        kwargs["memory"] = "20GB" if kwargs.get("memory", 0) == 0 else kwargs["memory"]
         super().__init__(*args, **kwargs)
 
         if keep_candidate_mode not in [
@@ -160,7 +172,7 @@ class VideoCaptioningFromFramesMapper(Mapper):
             trust_remote_code=trust_remote_code
         )
 
-    def _process_single_sample(self, ori_sample, rank=None, context=False):
+    def _process_single_sample_actor(self, ori_sample, model, processor, rank=None, context=False):
 
         # there is no videos in this sample
         if self.video_key not in ori_sample or not ori_sample[self.video_key]:
@@ -181,7 +193,7 @@ class VideoCaptioningFromFramesMapper(Mapper):
 
         text = sample[self.text_key]
         offset = 0
-        model, processor = get_model(self.model_key, rank, self.use_cuda())
+        # model, processor = get_model(self.model_key, rank, self.use_cuda())
 
         for chunk in text.split(SpecialTokens.eoc):
 
@@ -330,6 +342,167 @@ class VideoCaptioningFromFramesMapper(Mapper):
             generated_text_per_chunk.append(
                 generated_text_candidates_single_chunk[max_index])
         return generated_text_per_chunk
+
+    def process_batched_actor(self, samples, model, processor, rank=None, context=False):
+        """
+        Process a batch of samples in the actor.
+        With the model and processor loaded when the actor was created.
+        """
+        # reconstruct samples from "dict of lists" to "list of dicts"
+        reconstructed_samples = []
+        for i in range(len(samples[self.text_key])):
+            reconstructed_samples.append(
+                {key: samples[key][i]
+                 for key in samples})
+        samples_after_generation = []
+        # do generation for each sample within the batch
+        for ori_sample in reconstructed_samples:
+            if self.keep_original_sample:
+                samples_after_generation.append(ori_sample)
+            generated_samples = self._process_single_sample_actor(ori_sample,
+                                                                  model,
+                                                                  processor,
+                                                                  rank=rank,
+                                                                  context=context)
+            if len(generated_samples) != 0:
+                samples_after_generation.extend(generated_samples)
+        # reconstruct samples from "list of dicts" to "dict of lists"
+        keys = samples_after_generation[0].keys()
+        res_samples = {}
+        for key in keys:
+            res_samples[key] = [s[key] for s in samples_after_generation]
+
+        return res_samples
+
+    def _process_single_sample(self, ori_sample, rank=None, context=False):
+        # there is no videos in this sample
+        if self.video_key not in ori_sample or not ori_sample[self.video_key]:
+            return []
+
+        # the generated results
+        generated_samples = [
+            copy.deepcopy(ori_sample)
+            for _ in range(self.num_newly_generated_samples)
+        ]
+        for generated_sample in generated_samples:
+            generated_sample[self.text_key] = ''
+
+        # load videos
+        loaded_video_keys = ori_sample[self.video_key]
+        sample, videos = load_data_with_context(ori_sample, context,
+                                                loaded_video_keys, load_video)
+
+        text = sample[self.text_key]
+        offset = 0
+        model, processor = get_model(self.model_key, rank, self.use_cuda())
+
+        for chunk in text.split(SpecialTokens.eoc):
+
+            video_count = chunk.count(SpecialTokens.video)
+
+            # no video or no text
+            if video_count == 0 or len(chunk.strip()) == 0:
+                continue
+            else:
+                text_with_only_special_tokens = remove_non_special_tokens(
+                    chunk)
+                # generate candidate caption(s) in batch manner
+                generated_text_candidates_single_chunk = [
+                    [] for _ in range(self.caption_num)
+                ]
+                for video_key in loaded_video_keys[offset:offset +
+                                                   video_count]:
+                    video = videos[video_key]
+                    video_frame_videos_chunk = []
+                    # extract frame videos
+                    if self.frame_sampling_method == 'all_keyframes':
+                        frames = extract_key_frames(video)
+                    elif self.frame_sampling_method == 'uniform':
+                        frames = extract_video_frames_uniformly(
+                            video, self.frame_num)
+                    else:
+                        frames = []
+                    frame_videos = [frame.to_image() for frame in frames]
+                    for frame in frame_videos:
+                        if self.horizontal_flip:
+                            frame = ImageOps.mirror(frame)
+                        if self.vertical_flip:
+                            frame = ImageOps.flip(frame)
+                        video_frame_videos_chunk.append(frame)
+
+                    # construct prompts
+                    if self.prompt_key and isinstance(
+                            ori_sample[self.prompt_key], str):
+                        # check prompt_key is not None, and it's a str
+                        # in the sample
+                        prompt_texts = [ori_sample[self.prompt_key]
+                                        ] * len(video_frame_videos_chunk)
+                    elif self.prompt and isinstance(self.prompt, str):
+                        # check prompt is not None, and it's a str
+                        prompt_texts = [self.prompt
+                                        ] * len(video_frame_videos_chunk)
+                    else:
+                        prompt_texts = None
+
+                    inputs = processor(
+                        text=prompt_texts,
+                        images=video_frame_videos_chunk,
+                        return_tensors='pt',
+                    ).to(model.device)
+                    with torch.no_grad():
+                        for i in range(self.caption_num):
+                            generated_ids = model.generate(**inputs,
+                                                           max_new_tokens=128,
+                                                           do_sample=True)
+                            generated_text = processor.batch_decode(
+                                generated_ids, skip_special_tokens=True)
+                            generated_text_candidates_single_chunk[i] += [
+                                '. '.join([txt.strip() for txt in generated_text])
+                            ]
+
+                # 3. insert a list of generated captions into the positions of
+                # subsequent placeholders in the original string
+                new_generated_text_all_videos = [
+                    [] for _ in range(self.num_newly_generated_samples)
+                ]
+                # new_generated_text_all_videos is a helper array,
+                # element [i][j]
+                # denotes the reduced $i$-th result for the $j$-th video
+
+                # reduce the captions according to given mode video by video
+                for j in range(video_count):
+                    new_generated_text_per_video = self._reduce_captions(
+                        chunk,
+                        [
+                            captions[j] for captions in
+                            generated_text_candidates_single_chunk
+                        ],
+                    )
+                    assert self.num_newly_generated_samples == len(
+                        new_generated_text_per_video)
+                    for i in range(len(new_generated_text_per_video)):
+                        new_generated_text_all_videos[i].append(
+                            new_generated_text_per_video[i])
+
+                # insert the captions according to given mode
+                place_holders = [SpecialTokens.video] * video_count
+                for i in range(self.num_newly_generated_samples):
+                    generated_text_per_chunk = insert_texts_after_placeholders(
+                        original_string=text_with_only_special_tokens,
+                        placeholders=place_holders,
+                        new_texts=new_generated_text_all_videos[i],
+                    )
+                    generated_samples[i][
+                        self.
+                        text_key] += f'{generated_text_per_chunk}' \
+                                     f'{SpecialTokens.eoc}'
+
+                offset += video_count
+
+        if not context:
+            for vid_key in videos:
+                close_video(videos[vid_key])
+        return generated_samples
 
     def process_batched(self, samples, rank=None, context=False):
         """
